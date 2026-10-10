@@ -1,24 +1,24 @@
 //! The multiplexer server: owns sessions, windows, panes (ptys) and renders frames for clients.
-use crate::config::Config;
+use crate::commands::{self, Cmd, key_name};
+use crate::config::{Config, config_path};
+use crate::copy::{self, CopyState};
 use crate::ipc;
 use crate::keys;
 use crate::layout::{Dir, Move, Node, Rect, neighbor};
 use crate::proto::{ClientMsg, Command, ServerMsg, read_msg, write_msg};
-use crate::render::{Frame, render_client};
+use crate::render::{Frame, chooser_entries, render_client};
 use anyhow::{Result, anyhow};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use interprocess::local_socket::prelude::*;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)]
 pub struct Pane {
-    pub id: usize,
     pub parser: vt100::Parser,
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
@@ -26,17 +26,52 @@ pub struct Pane {
     pub rect: Rect,
     pub last_output: Instant,
     pub attention: bool,
-    pub copy: bool,
+    pub copy: Option<CopyState>,
 }
 
 impl Pane {
     pub fn busy(&self, cfg: &Config) -> bool {
         self.last_output.elapsed().as_secs_f32() < cfg.busy_secs
     }
+
+    /// Name of the foreground process in this pane, if the platform lets us find it.
+    pub fn foreground_name(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            let pid = self.master.process_group_leader()?;
+            #[cfg(target_os = "linux")]
+            {
+                return std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .ok()
+                    .map(|s| s.trim().to_string());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let mut buf = [0u8; 256];
+                let n = unsafe {
+                    libc::proc_name(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+                };
+                if n > 0 {
+                    return Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned());
+                }
+                return None;
+            }
+            #[allow(unreachable_code)]
+            {
+                let _ = pid;
+                None
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
 }
 
 pub struct Window {
     pub name: String,
+    pub manual_name: bool,
     pub layout: Node,
     pub active: usize,
     pub zoomed: bool,
@@ -61,15 +96,35 @@ pub struct Session {
     pub last_used: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PromptKind {
+    Command,
+    RenameWindow,
+    RenameSession,
+}
+
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub buf: String,
+}
+
 pub struct Client {
     pub session: String,
     pub sender: Box<dyn Write + Send>,
     pub prefix: bool,
     pub frame: Frame,
+    pub prompt: Option<Prompt>,
+    pub chooser: Option<usize>,
+    pub popup: Option<(Vec<String>, usize)>,
+    pub message: Option<(String, Instant)>,
+    /// mouse drag start: (pane, abs row, col), and whether we moved
+    pub drag: Option<(usize, i64, u16, bool)>,
 }
 
 pub struct State {
     pub cfg: Config,
+    pub bindings: BTreeMap<String, String>,
+    pub buffer: Option<String>,
     pub panes: HashMap<usize, Pane>,
     pub sessions: Vec<Session>,
     pub clients: HashMap<usize, Client>,
@@ -118,6 +173,22 @@ impl State {
         self.sessions.iter().position(|s| s.name == name)
     }
 
+    fn client_si(&self, cid: usize) -> Option<usize> {
+        self.clients.get(&cid).and_then(|c| self.sidx(&c.session))
+    }
+
+    fn active_pane(&self, si: usize) -> usize {
+        let s = &self.sessions[si];
+        s.windows[s.active].active
+    }
+
+    fn message(&mut self, cid: usize, msg: impl Into<String>) {
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.message = Some((msg.into(), Instant::now()));
+        }
+        self.mark_dirty();
+    }
+
     fn spawn_pane(
         &mut self,
         shared: &Shared,
@@ -135,9 +206,9 @@ impl State {
         };
         let pair = pty.openpty(size).map_err(|e| anyhow!("{e}"))?;
         let shell = self.cfg.default_shell();
-        let mut parts = shell.split_whitespace();
-        let mut cmd = CommandBuilder::new(parts.next().unwrap_or("sh"));
-        for a in parts {
+        let words = commands::tokenize(&shell);
+        let mut cmd = CommandBuilder::new(words.first().map(|s| s.as_str()).unwrap_or("sh"));
+        for a in words.iter().skip(1) {
             cmd.arg(a);
         }
         cmd.env("TERM", "xterm-256color");
@@ -152,7 +223,6 @@ impl State {
         let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("{e}"))?;
         let writer = pair.master.take_writer().map_err(|e| anyhow!("{e}"))?;
         let pane = Pane {
-            id,
             parser: vt100::Parser::new(size.rows, size.cols, self.cfg.scrollback),
             master: pair.master,
             writer,
@@ -165,7 +235,7 @@ impl State {
             },
             last_output: Instant::now(),
             attention: false,
-            copy: false,
+            copy: None,
         };
         self.panes.insert(id, pane);
         let shared = shared.clone();
@@ -195,7 +265,10 @@ impl State {
 
     fn shell_name(&self) -> String {
         let s = self.cfg.default_shell();
-        let first = s.split_whitespace().next().unwrap_or("sh").to_string();
+        let first = commands::tokenize(&s)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "sh".into());
         std::path::Path::new(&first)
             .file_stem()
             .map(|x| x.to_string_lossy().into_owned())
@@ -234,21 +307,23 @@ impl State {
             last_used: Instant::now(),
         });
         let si = self.sessions.len() - 1;
-        if let Err(e) = self.new_window(shared, si) {
+        if let Err(e) = self.new_window(shared, si, None) {
             self.sessions.pop();
             return Err(e);
         }
         Ok(name)
     }
 
-    fn new_window(&mut self, shared: &Shared, si: usize) -> Result<()> {
+    fn new_window(&mut self, shared: &Shared, si: usize, name: Option<String>) -> Result<()> {
         let area = self.pane_area(&self.sessions[si]);
         let cwd = self.sessions[si].cwd.clone();
         let id = self.spawn_pane(shared, area.h, area.w, cwd.as_deref())?;
-        let name = self.shell_name();
+        let manual = name.is_some();
+        let name = name.unwrap_or_else(|| self.shell_name());
         let s = &mut self.sessions[si];
         s.windows.push(Window {
             name,
+            manual_name: manual,
             layout: Node::Leaf(id),
             active: id,
             zoomed: false,
@@ -299,10 +374,23 @@ impl State {
                         pixel_width: 0,
                         pixel_height: 0,
                     });
+                    if let Some(c) = &mut p.copy {
+                        c.cx = c.cx.min(r.w - 1);
+                        c.cy = c.cy.min(r.h - 1);
+                    }
                 }
             }
         }
         self.mark_dirty();
+    }
+
+    fn relayout_all(&mut self) {
+        for si in 0..self.sessions.len() {
+            self.relayout(si);
+        }
+        for c in self.clients.values_mut() {
+            c.frame.invalidate();
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -353,6 +441,12 @@ impl State {
     }
 
     fn drop_clients_of(&mut self, session: &str, reason: &str) {
+        // Move clients to another session if one exists (like tmux detach-on-destroy off)
+        let other = self
+            .sessions
+            .iter()
+            .max_by_key(|s| s.last_used)
+            .map(|s| s.name.clone());
         let ids: Vec<usize> = self
             .clients
             .iter()
@@ -360,6 +454,12 @@ impl State {
             .map(|(i, _)| *i)
             .collect();
         for id in ids {
+            if let Some(o) = &other {
+                let c = self.clients.get_mut(&id).unwrap();
+                c.session = o.clone();
+                c.frame.invalidate();
+                continue;
+            }
             if let Some(mut c) = self.clients.remove(&id) {
                 let _ = write_msg(&mut c.sender, &ServerMsg::Exit(reason.into()));
             }
@@ -378,12 +478,10 @@ impl State {
         self.drop_clients_of(&s.name, "session killed");
     }
 
-    fn write_active(&mut self, si: usize, bytes: &[u8]) {
-        let s = &self.sessions[si];
-        let pid = s.windows[s.active].active;
+    fn write_pane(&mut self, pid: usize, bytes: &[u8]) {
         if let Some(p) = self.panes.get_mut(&pid) {
-            if p.copy {
-                p.copy = false;
+            if p.copy.is_some() {
+                p.copy = None;
                 p.parser.screen_mut().set_scrollback(0);
                 self.dirty = true;
             }
@@ -392,11 +490,356 @@ impl State {
         }
     }
 
-    fn handle_event(&mut self, shared: &Shared, cid: usize, ev: Event) {
-        let Some(c) = self.clients.get(&cid) else {
+    fn paste(&mut self, pid: usize, text: &str) {
+        let bp = self
+            .panes
+            .get(&pid)
+            .map(|p| p.parser.screen().bracketed_paste())
+            .unwrap_or(false);
+        let text = text.replace("\r\n", "\r").replace('\n', "\r");
+        let data = if bp {
+            format!("\x1b[200~{text}\x1b[201~")
+        } else {
+            text
+        };
+        self.write_pane(pid, data.as_bytes());
+    }
+
+    fn set_clipboard(&mut self, cid: usize, text: String) {
+        let n = text.chars().count();
+        if self.cfg.osc52 {
+            let seq = copy::osc52(&text);
+            for c in self.clients.values_mut() {
+                let _ = write_msg(&mut c.sender, &ServerMsg::Output(seq.clone()));
+            }
+        }
+        self.buffer = Some(text);
+        self.message(cid, format!("copied {n} characters"));
+    }
+
+    fn switch_session(&mut self, cid: usize, ni: usize) {
+        let Some(si) = self.client_si(cid) else {
             return;
         };
-        let Some(si) = self.sidx(&c.session) else {
+        let (cols, rows) = (self.sessions[si].cols, self.sessions[si].rows);
+        let s = &mut self.sessions[ni];
+        s.cols = cols;
+        s.rows = rows;
+        s.last_used = Instant::now();
+        let name = s.name.clone();
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.session = name;
+            c.frame.invalidate();
+        }
+        self.relayout(ni);
+    }
+
+    pub fn reload_config(&mut self, path: Option<&str>) -> Result<String, String> {
+        let p = match path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => config_path().ok_or("no config path")?,
+        };
+        let is_toml = p.extension().is_some_and(|e| e == "toml");
+        if is_toml {
+            let cfg = if p.exists() {
+                Config::load_from(&p)?
+            } else {
+                Config::default()
+            };
+            self.cfg = cfg;
+            let (b, errs) = self.cfg.bindings();
+            self.bindings = b;
+            let mut errs = errs;
+            for c in self.cfg.commands.clone() {
+                if let Err(e) = commands::parse(&c).and_then(|cmd| self.exec_global(cmd)) {
+                    errs.push(e);
+                }
+            }
+            self.relayout_all();
+            if errs.is_empty() {
+                Ok(format!("sourced {}", p.display()))
+            } else {
+                Err(errs.join("; "))
+            }
+        } else {
+            let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let mut errs = vec![];
+            for line in text.lines() {
+                if commands::tokenize(line).is_empty() {
+                    continue;
+                }
+                if let Err(e) = commands::parse(line).and_then(|cmd| self.exec_global(cmd)) {
+                    errs.push(e);
+                }
+            }
+            self.relayout_all();
+            if errs.is_empty() {
+                Ok(format!("sourced {}", p.display()))
+            } else {
+                Err(errs.join("; "))
+            }
+        }
+    }
+
+    /// Commands that do not need a client/session.
+    fn exec_global(&mut self, cmd: Cmd) -> Result<(), String> {
+        match cmd {
+            Cmd::Set(k, v) => {
+                self.cfg.set(&k, &v)?;
+                if k == "sidebar" {
+                    let sb = self.cfg.sidebar;
+                    for s in &mut self.sessions {
+                        s.sidebar = sb;
+                    }
+                }
+                self.relayout_all();
+            }
+            Cmd::BindKey(k, c) => {
+                self.bindings.insert(k, c);
+            }
+            Cmd::UnbindKey(k) => {
+                if k == "*" {
+                    self.bindings.clear();
+                } else {
+                    self.bindings.remove(&k);
+                }
+            }
+            Cmd::SourceFile(p) => {
+                self.reload_config(p.as_deref())?;
+            }
+            other => return Err(format!("{other:?}: needs an attached client")),
+        }
+        Ok(())
+    }
+
+    pub fn exec(&mut self, shared: &Shared, cid: usize, cmd: Cmd) -> Result<(), String> {
+        let Some(si) = self.client_si(cid) else {
+            return self.exec_global(cmd);
+        };
+        let e = |e: anyhow::Error| e.to_string();
+        match cmd {
+            Cmd::SplitWindow { horizontal } => self
+                .split(shared, si, if horizontal { Dir::H } else { Dir::V })
+                .map_err(e)?,
+            Cmd::NewWindow { name } => self.new_window(shared, si, name).map_err(e)?,
+            Cmd::RenameWindow(None) | Cmd::RenameSession(None) | Cmd::CommandPrompt => {
+                let s = &self.sessions[si];
+                let (kind, buf) = match cmd {
+                    Cmd::RenameWindow(_) => {
+                        (PromptKind::RenameWindow, s.windows[s.active].name.clone())
+                    }
+                    Cmd::RenameSession(_) => (PromptKind::RenameSession, s.name.clone()),
+                    _ => (PromptKind::Command, String::new()),
+                };
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.prompt = Some(Prompt { kind, buf });
+                }
+            }
+            Cmd::RenameWindow(Some(n)) => {
+                let s = &mut self.sessions[si];
+                let w = &mut s.windows[s.active];
+                w.manual_name = !n.is_empty();
+                if !n.is_empty() {
+                    w.name = n;
+                }
+            }
+            Cmd::RenameSession(Some(n)) => {
+                if n.is_empty() || n.contains(':') {
+                    return Err("invalid session name".into());
+                }
+                if self.sidx(&n).is_some_and(|i| i != si) {
+                    return Err(format!("duplicate session: {n}"));
+                }
+                let old = std::mem::replace(&mut self.sessions[si].name, n.clone());
+                for c in self.clients.values_mut() {
+                    if c.session == old {
+                        c.session = n.clone();
+                    }
+                }
+            }
+            Cmd::KillPane => {
+                let pid = self.active_pane(si);
+                self.pane_exited(pid);
+            }
+            Cmd::KillWindow => {
+                let s = &self.sessions[si];
+                for pid in s.windows[s.active].panes() {
+                    self.pane_exited(pid);
+                }
+            }
+            Cmd::KillSession => self.kill_session(si),
+            Cmd::KillServer => {
+                while !self.sessions.is_empty() {
+                    self.kill_session(0);
+                }
+                std::process::exit(0);
+            }
+            Cmd::SelectPane(m) => {
+                let s = &self.sessions[si];
+                let w = &s.windows[s.active];
+                let rects = self.visible_rects(s, w);
+                if let Some(n) = neighbor(&rects, w.active, m) {
+                    let s = &mut self.sessions[si];
+                    let w = &mut s.windows[s.active];
+                    w.active = n;
+                    w.zoomed = false;
+                    self.relayout(si);
+                }
+            }
+            Cmd::NextPane => {
+                let s = &mut self.sessions[si];
+                let w = &mut s.windows[s.active];
+                let panes = w.panes();
+                let i = panes.iter().position(|p| *p == w.active).unwrap_or(0);
+                w.active = panes[(i + 1) % panes.len()];
+                if w.zoomed {
+                    self.relayout(si);
+                }
+            }
+            Cmd::ResizePane(m, n) => {
+                let area = self.pane_area(&self.sessions[si]);
+                let s = &mut self.sessions[si];
+                let w = &mut s.windows[s.active];
+                let (dir, sign, total) = match m {
+                    Move::Left => (Dir::H, -1.0, area.w),
+                    Move::Right => (Dir::H, 1.0, area.w),
+                    Move::Up => (Dir::V, -1.0, area.h),
+                    Move::Down => (Dir::V, 1.0, area.h),
+                };
+                let target = w.active;
+                w.layout
+                    .resize(target, dir, sign * n as f32 / total.max(1) as f32);
+                self.relayout(si);
+            }
+            Cmd::Zoom => {
+                let s = &mut self.sessions[si];
+                let w = &mut s.windows[s.active];
+                w.zoomed = !w.zoomed && w.panes().len() > 1;
+                self.relayout(si);
+            }
+            Cmd::NextWindow | Cmd::PrevWindow | Cmd::SelectWindow(_) => {
+                let s = &mut self.sessions[si];
+                let n = s.windows.len();
+                s.active = match cmd {
+                    Cmd::NextWindow => (s.active + 1) % n,
+                    Cmd::PrevWindow => (s.active + n - 1) % n,
+                    Cmd::SelectWindow(i) if i < n => i,
+                    _ => return Err("no such window".into()),
+                };
+                self.relayout(si);
+            }
+            Cmd::CopyMode { page_up } => {
+                let pid = self.active_pane(si);
+                if let Some(p) = self.panes.get_mut(&pid) {
+                    let (cy, cx) = p.parser.screen().cursor_position();
+                    let c = p.copy.get_or_insert(CopyState {
+                        cx,
+                        cy,
+                        anchor: None,
+                        line: false,
+                    });
+                    if page_up {
+                        let off = p.parser.screen().scrollback() + p.rect.h as usize;
+                        p.parser.screen_mut().set_scrollback(off);
+                        c.cy = 0;
+                    }
+                }
+            }
+            Cmd::PasteBuffer => {
+                if let Some(b) = self.buffer.clone() {
+                    let pid = self.active_pane(si);
+                    self.paste(pid, &b);
+                } else {
+                    return Err("no buffer".into());
+                }
+            }
+            Cmd::Detach => {
+                if let Some(mut c) = self.clients.remove(&cid) {
+                    let _ = write_msg(
+                        &mut c.sender,
+                        &ServerMsg::Exit(format!("detached (from session {})", c.session)),
+                    );
+                }
+            }
+            Cmd::ChooseTree => {
+                let entries = chooser_entries(self);
+                let cur = self.sessions[si].active;
+                let sel = entries
+                    .iter()
+                    .position(|e| e.0 == si && e.1 == Some(cur))
+                    .unwrap_or(0);
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.chooser = Some(sel);
+                }
+            }
+            Cmd::ToggleSidebar => {
+                let s = &mut self.sessions[si];
+                s.sidebar = !s.sidebar;
+                self.relayout(si);
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.frame.invalidate();
+                }
+            }
+            Cmd::SourceFile(p) => {
+                let m = self.reload_config(p.as_deref())?;
+                self.message(cid, m);
+            }
+            Cmd::SwitchClient { next } => {
+                let n = self.sessions.len();
+                if n > 1 {
+                    let ni = if next { (si + 1) % n } else { (si + n - 1) % n };
+                    self.switch_session(cid, ni);
+                }
+            }
+            Cmd::SendPrefix => {
+                let (c, ctrl) = {
+                    let p = self.cfg.prefix_name();
+                    match p.strip_prefix("C-") {
+                        Some(r) if r.len() == 1 => (r.chars().next().unwrap(), true),
+                        _ => (p.chars().next().unwrap_or('b'), false),
+                    }
+                };
+                let k = KeyEvent::new(
+                    KeyCode::Char(c),
+                    if ctrl {
+                        KeyModifiers::CONTROL
+                    } else {
+                        KeyModifiers::NONE
+                    },
+                );
+                let pid = self.active_pane(si);
+                self.write_pane(pid, &keys::encode(&k, false));
+            }
+            Cmd::DisplayMessage(m) => self.message(cid, m),
+            Cmd::ListKeys => {
+                let mut lines = vec![
+                    format!(
+                        "prefix = {}   (j/k/Space scroll, q closes)",
+                        self.cfg.prefix_name()
+                    ),
+                    String::new(),
+                ];
+                for (k, c) in &self.bindings {
+                    lines.push(format!("{k:>10}  {c}"));
+                }
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.popup = Some((lines, 0));
+                }
+            }
+            other => self.exec_global(other)?,
+        }
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn run_line(&mut self, shared: &Shared, cid: usize, line: &str) {
+        if let Err(e) = commands::parse(line).and_then(|c| self.exec(shared, cid, c)) {
+            self.message(cid, e);
+        }
+    }
+
+    fn handle_event(&mut self, shared: &Shared, cid: usize, ev: Event) {
+        let Some(si) = self.client_si(cid) else {
             return;
         };
         self.sessions[si].last_used = Instant::now();
@@ -412,260 +855,388 @@ impl State {
             }
             Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(shared, cid, si, k),
             Event::Paste(text) => {
-                let s = &self.sessions[si];
-                let pid = s.windows[s.active].active;
-                let bp = self
-                    .panes
-                    .get(&pid)
-                    .map(|p| p.parser.screen().bracketed_paste())
-                    .unwrap_or(false);
-                let data = if bp {
-                    format!("\x1b[200~{text}\x1b[201~")
-                } else {
-                    text
-                };
-                self.write_active(si, data.as_bytes());
+                if let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                    p.buf.push_str(&text.replace(['\r', '\n'], " "));
+                    self.mark_dirty();
+                    return;
+                }
+                let pid = self.active_pane(si);
+                self.paste(pid, &text);
             }
-            Event::Mouse(m) if self.cfg.mouse => {
-                let s = &self.sessions[si];
-                let w = &s.windows[s.active];
-                let hit = self
-                    .visible_rects(s, w)
-                    .into_iter()
-                    .find(|(_, r)| r.contains(m.column, m.row))
-                    .map(|(i, _)| i);
-                match m.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(pid) = hit {
-                            let s = &mut self.sessions[si];
-                            s.windows[s.active].active = pid;
-                            self.mark_dirty();
-                        } else if m.row == s.rows - 1 {
-                            // click on status bar: select window by label position
-                            if let Some(wi) = crate::render::status_hit(s, m.column) {
-                                self.sessions[si].active = wi;
-                                self.relayout(si);
-                            }
+            Event::Mouse(m) if self.cfg.mouse => self.handle_mouse(cid, si, m),
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, cid: usize, si: usize, m: crossterm::event::MouseEvent) {
+        let s = &self.sessions[si];
+        let w = &s.windows[s.active];
+        let rects = self.visible_rects(s, w);
+        let hit = rects
+            .iter()
+            .find(|(_, r)| r.contains(m.column, m.row))
+            .copied();
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.drag = None;
+                    if c.chooser.is_some() || c.popup.is_some() {
+                        c.chooser = None;
+                        c.popup = None;
+                        self.mark_dirty();
+                        return;
+                    }
+                }
+                if let Some((pid, r)) = hit {
+                    let s = &mut self.sessions[si];
+                    s.windows[s.active].active = pid;
+                    if let Some(p) = self.panes.get_mut(&pid) {
+                        if let Some(cs) = &mut p.copy {
+                            cs.anchor = None;
+                        }
+                        let off = p.parser.screen().scrollback();
+                        let row = copy::abs_row(m.row - r.y, off);
+                        if let Some(c) = self.clients.get_mut(&cid) {
+                            c.drag = Some((pid, row, m.column - r.x, false));
                         }
                     }
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                        let up = m.kind == MouseEventKind::ScrollUp;
-                        if let Some(pid) = hit {
-                            let p = self.panes.get_mut(&pid).unwrap();
-                            if p.parser.screen().alternate_screen() {
-                                let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-                                for _ in 0..3 {
-                                    let _ = p.writer.write_all(seq);
-                                }
-                                let _ = p.writer.flush();
-                            } else {
-                                let cur = p.parser.screen().scrollback();
-                                let new = if up { cur + 3 } else { cur.saturating_sub(3) };
-                                p.parser.screen_mut().set_scrollback(new);
-                                p.copy = p.parser.screen().scrollback() > 0;
-                                self.mark_dirty();
-                            }
-                        }
+                    self.mark_dirty();
+                } else if m.row == s.rows - 1 {
+                    if let Some(wi) = crate::render::status_hit(s, m.column) {
+                        self.sessions[si].active = wi;
+                        self.relayout(si);
                     }
-                    _ => {}
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some((pid, row, col, _)) = self.clients.get(&cid).and_then(|c| c.drag) else {
+                    return;
+                };
+                let Some(r) = rects.iter().find(|(i, _)| *i == pid).map(|x| x.1) else {
+                    return;
+                };
+                let Some(p) = self.panes.get_mut(&pid) else {
+                    return;
+                };
+                let mut cy = m.row.clamp(r.y, r.y + r.h - 1) - r.y;
+                let cx = m.column.clamp(r.x, r.x + r.w - 1) - r.x;
+                // auto-scroll when dragging past the edges
+                let off = p.parser.screen().scrollback();
+                if m.row < r.y {
+                    p.parser.screen_mut().set_scrollback(off + 1);
+                    cy = 0;
+                } else if m.row >= r.y + r.h && off > 0 {
+                    p.parser.screen_mut().set_scrollback(off - 1);
+                }
+                let cs = p.copy.get_or_insert_with(CopyState::default);
+                cs.anchor = Some((row, col));
+                cs.line = false;
+                cs.cx = cx;
+                cs.cy = cy;
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.drag = Some((pid, row, col, true));
+                }
+                self.mark_dirty();
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some((pid, _, _, moved)) =
+                    self.clients.get_mut(&cid).and_then(|c| c.drag.take())
+                else {
+                    return;
+                };
+                if moved {
+                    self.copy_selection(cid, pid);
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = m.kind == MouseEventKind::ScrollUp;
+                if let Some((pid, r)) = hit {
+                    let p = self.panes.get_mut(&pid).unwrap();
+                    if p.parser.screen().alternate_screen() {
+                        let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+                        for _ in 0..3 {
+                            let _ = p.writer.write_all(seq);
+                        }
+                        let _ = p.writer.flush();
+                    } else {
+                        let cur = p.parser.screen().scrollback();
+                        let new = if up { cur + 3 } else { cur.saturating_sub(3) };
+                        p.parser.screen_mut().set_scrollback(new);
+                        if p.parser.screen().scrollback() > 0 {
+                            p.copy.get_or_insert(CopyState {
+                                cx: 0,
+                                cy: r.h - 1,
+                                anchor: None,
+                                line: false,
+                            });
+                        } else if p.copy.as_ref().is_some_and(|c| c.anchor.is_none()) {
+                            p.copy = None;
+                        }
+                        self.mark_dirty();
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    fn handle_key(&mut self, shared: &Shared, cid: usize, si: usize, k: KeyEvent) {
-        let prefix = self.clients[&cid].prefix;
-        if prefix {
-            self.clients.get_mut(&cid).unwrap().prefix = false;
-            self.mark_dirty();
-            if self.cfg.is_prefix(&k) {
-                let b = keys::encode(&k, false);
-                self.write_active(si, &b);
-                return;
-            }
-            self.binding(shared, cid, si, k);
-            return;
-        }
-        if self.cfg.is_prefix(&k) {
-            self.clients.get_mut(&cid).unwrap().prefix = true;
-            self.mark_dirty();
-            return;
-        }
-        let s = &self.sessions[si];
-        let pid = s.windows[s.active].active;
+    fn copy_selection(&mut self, cid: usize, pid: usize) {
         let Some(p) = self.panes.get_mut(&pid) else {
             return;
         };
-        if p.copy {
-            let h = p.rect.h as usize;
-            let cur = p.parser.screen().scrollback();
-            let new = match k.code {
-                KeyCode::Up | KeyCode::Char('k') => Some(cur + 1),
-                KeyCode::Down | KeyCode::Char('j') => Some(cur.saturating_sub(1)),
-                KeyCode::PageUp | KeyCode::Char('u') => Some(cur + h),
-                KeyCode::PageDown | KeyCode::Char('d') => Some(cur.saturating_sub(h)),
-                KeyCode::Char('g') => Some(usize::MAX),
-                KeyCode::Char('G') => Some(0),
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    p.copy = false;
-                    Some(0)
-                }
-                _ => None,
-            };
-            if let Some(n) = new {
-                p.parser.screen_mut().set_scrollback(n);
+        let Some(cs) = p.copy.clone() else { return };
+        let Some(anchor) = cs.anchor else { return };
+        let off = p.parser.screen().scrollback();
+        let cur = (copy::abs_row(cs.cy, off), cs.cx);
+        let text = copy::extract(&mut p.parser, anchor, cur, cs.line);
+        p.copy = None;
+        p.parser.screen_mut().set_scrollback(0);
+        self.set_clipboard(cid, text);
+    }
+
+    fn handle_key(&mut self, shared: &Shared, cid: usize, si: usize, k: KeyEvent) {
+        let Some(c) = self.clients.get_mut(&cid) else {
+            return;
+        };
+        // overlays first
+        if let Some((lines, off)) = &mut c.popup {
+            let max = lines.len().saturating_sub(1);
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => *off = (*off + 1).min(max),
+                KeyCode::Up | KeyCode::Char('k') => *off = off.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => *off = (*off + 10).min(max),
+                KeyCode::PageUp => *off = off.saturating_sub(10),
+                _ => c.popup = None,
             }
             self.mark_dirty();
             return;
         }
-        let app = p.parser.screen().application_cursor();
-        let b = keys::encode(&k, app);
-        self.write_active(si, &b);
-    }
-
-    fn binding(&mut self, shared: &Shared, cid: usize, si: usize, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = k.modifiers.contains(KeyModifiers::ALT);
-        let mv = |code: KeyCode| match code {
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => Some(Move::Left),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => Some(Move::Right),
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => Some(Move::Up),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => Some(Move::Down),
-            _ => None,
-        };
-        let is_resize = ctrl || alt || matches!(k.code, KeyCode::Char('H' | 'J' | 'K' | 'L'));
-        if let Some(m) = mv(k.code) {
-            let s = &mut self.sessions[si];
-            let nw = s.windows.len();
-            let _ = nw;
-            if is_resize {
-                let w = &mut s.windows[s.active];
-                let (dir, delta) = match m {
-                    Move::Left => (Dir::H, -0.05),
-                    Move::Right => (Dir::H, 0.05),
-                    Move::Up => (Dir::V, -0.05),
-                    Move::Down => (Dir::V, 0.05),
-                };
-                // grow towards direction: right/down grows panes on the left/top
-                let target = w.active;
-                w.layout.resize(target, dir, delta);
-                self.relayout(si);
-            } else {
-                let s = &self.sessions[si];
-                let w = &s.windows[s.active];
-                let rects = self.visible_rects(s, w);
-                if let Some(n) = neighbor(&rects, w.active, m) {
-                    let s = &mut self.sessions[si];
-                    s.windows[s.active].active = n;
-                    self.mark_dirty();
+        if let Some(sel) = c.chooser {
+            let entries = chooser_entries(self);
+            let c = self.clients.get_mut(&cid).unwrap();
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => c.chooser = Some(sel.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    c.chooser = Some((sel + 1).min(entries.len().saturating_sub(1)))
                 }
+                KeyCode::Enter => {
+                    c.chooser = None;
+                    if let Some(&(nsi, wi)) = entries.get(sel) {
+                        self.switch_session(cid, nsi);
+                        if let Some(wi) = wi {
+                            self.sessions[nsi].active = wi;
+                            self.relayout(nsi);
+                        }
+                    }
+                }
+                KeyCode::Char('x') => {
+                    c.chooser = None;
+                    if let Some(&(nsi, wi)) = entries.get(sel) {
+                        match wi {
+                            Some(wi) => {
+                                for pid in self.sessions[nsi].windows[wi].panes() {
+                                    self.pane_exited(pid);
+                                }
+                            }
+                            None => self.kill_session(nsi),
+                        }
+                    }
+                }
+                _ => c.chooser = None,
+            }
+            self.mark_dirty();
+            return;
+        }
+        if let Some(p) = &mut c.prompt {
+            match k.code {
+                KeyCode::Enter => {
+                    let p = c.prompt.take().unwrap();
+                    let line = match p.kind {
+                        PromptKind::Command => p.buf,
+                        PromptKind::RenameWindow => {
+                            format!("rename-window \"{}\"", p.buf.replace('"', "\\\""))
+                        }
+                        PromptKind::RenameSession => {
+                            format!("rename-session \"{}\"", p.buf.replace('"', "\\\""))
+                        }
+                    };
+                    if !line.trim().is_empty() {
+                        self.run_line(shared, cid, &line);
+                    }
+                }
+                KeyCode::Esc => c.prompt = None,
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    c.prompt = None
+                }
+                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.clear(),
+                KeyCode::Backspace => {
+                    p.buf.pop();
+                }
+                KeyCode::Char(ch) if !k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.push(ch),
+                _ => {}
+            }
+            self.mark_dirty();
+            return;
+        }
+        if c.prefix {
+            c.prefix = false;
+            self.mark_dirty();
+            if self.cfg.is_prefix(&k) {
+                let _ = self.exec(shared, cid, Cmd::SendPrefix);
+                return;
+            }
+            let Some(name) = key_name(&k) else { return };
+            match self.bindings.get(&name).cloned() {
+                Some(line) => self.run_line(shared, cid, &line),
+                None => {}
             }
             return;
         }
+        if self.cfg.is_prefix(&k) {
+            c.prefix = true;
+            self.mark_dirty();
+            return;
+        }
+        let pid = self.active_pane(si);
+        if self.panes.get(&pid).is_some_and(|p| p.copy.is_some()) {
+            self.copy_key(cid, pid, k);
+            return;
+        }
+        let Some(p) = self.panes.get_mut(&pid) else {
+            return;
+        };
+        let app = p.parser.screen().application_cursor();
+        let b = keys::encode(&k, app);
+        self.write_pane(pid, &b);
+    }
+
+    #[allow(unused_assignments)]
+    fn copy_key(&mut self, cid: usize, pid: usize, k: KeyEvent) {
+        let Some(p) = self.panes.get_mut(&pid) else {
+            return;
+        };
+        let (h, w) = (p.rect.h, p.rect.w);
+        let mut off = p.parser.screen().scrollback();
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let mut cs = p.copy.clone().unwrap();
+        let scroll_to = |n: usize, parser: &mut vt100::Parser| -> usize {
+            parser.screen_mut().set_scrollback(n);
+            parser.screen().scrollback()
+        };
+        let row_text = |parser: &vt100::Parser, y: u16| -> String {
+            (0..w)
+                .map(|x| {
+                    parser
+                        .screen()
+                        .cell(y, x)
+                        .map(|c| c.contents().to_string())
+                        .unwrap_or_default()
+                })
+                .map(|s| if s.is_empty() { " ".into() } else { s })
+                .collect()
+        };
+        let mut done = false;
         match k.code {
-            KeyCode::Char('c') => {
-                let _ = self.new_window(shared, si);
+            KeyCode::Char('q') | KeyCode::Esc
+                if cs.anchor.is_none() || k.code == KeyCode::Char('q') =>
+            {
+                done = true
             }
-            KeyCode::Char('%') | KeyCode::Char('|') => {
-                let _ = self.split(shared, si, Dir::H);
-            }
-            KeyCode::Char('"') | KeyCode::Char('-') => {
-                let _ = self.split(shared, si, Dir::V);
-            }
-            KeyCode::Char('n') => {
-                let s = &mut self.sessions[si];
-                s.active = (s.active + 1) % s.windows.len();
-                self.relayout(si);
-            }
-            KeyCode::Char('p') => {
-                let s = &mut self.sessions[si];
-                s.active = (s.active + s.windows.len() - 1) % s.windows.len();
-                self.relayout(si);
-            }
-            KeyCode::Char(d @ '0'..='9') => {
-                let i = d as usize - '0' as usize;
-                if i < self.sessions[si].windows.len() {
-                    self.sessions[si].active = i;
-                    self.relayout(si);
+            KeyCode::Esc => cs.anchor = None,
+            KeyCode::Char('c') if ctrl => done = true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if cs.cy > 0 {
+                    cs.cy -= 1
+                } else {
+                    off = scroll_to(off + 1, &mut p.parser)
                 }
             }
-            KeyCode::Char('o') => {
-                let s = &mut self.sessions[si];
-                let w = &mut s.windows[s.active];
-                let panes = w.panes();
-                let i = panes.iter().position(|p| *p == w.active).unwrap_or(0);
-                w.active = panes[(i + 1) % panes.len()];
-                self.mark_dirty();
-            }
-            KeyCode::Char('z') => {
-                let s = &mut self.sessions[si];
-                let w = &mut s.windows[s.active];
-                w.zoomed = !w.zoomed && w.panes().len() > 1;
-                self.relayout(si);
-            }
-            KeyCode::Char('x') => {
-                let s = &self.sessions[si];
-                let pid = s.windows[s.active].active;
-                self.pane_exited(pid);
-            }
-            KeyCode::Char('&') => {
-                let s = &self.sessions[si];
-                for pid in s.windows[s.active].panes() {
-                    self.pane_exited(pid);
+            KeyCode::Down | KeyCode::Char('j') => {
+                if cs.cy + 1 < h {
+                    cs.cy += 1
+                } else if off > 0 {
+                    off = scroll_to(off - 1, &mut p.parser)
                 }
             }
-            KeyCode::Char('[') | KeyCode::PageUp => {
-                let s = &self.sessions[si];
-                let pid = s.windows[s.active].active;
-                if let Some(p) = self.panes.get_mut(&pid) {
-                    p.copy = true;
-                    if k.code == KeyCode::PageUp {
-                        let h = p.rect.h as usize;
-                        p.parser.screen_mut().set_scrollback(h);
-                    }
-                }
-                self.mark_dirty();
+            KeyCode::Left | KeyCode::Char('h') => cs.cx = cs.cx.saturating_sub(1),
+            KeyCode::Right | KeyCode::Char('l') => cs.cx = (cs.cx + 1).min(w - 1),
+            KeyCode::Char('0') | KeyCode::Home => cs.cx = 0,
+            KeyCode::Char('$') | KeyCode::End => {
+                cs.cx =
+                    (row_text(&p.parser, cs.cy).trim_end().chars().count() as u16).saturating_sub(1)
             }
-            KeyCode::Char('a') | KeyCode::Char('b') if !ctrl => {
-                let s = &mut self.sessions[si];
-                s.sidebar = !s.sidebar;
-                self.relayout(si);
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.frame.invalidate();
+            KeyCode::Char('w') => {
+                let t: Vec<char> = row_text(&p.parser, cs.cy).chars().collect();
+                let mut x = cs.cx as usize;
+                while x < t.len() && !t[x].is_whitespace() {
+                    x += 1;
                 }
-            }
-            KeyCode::Char('s') | KeyCode::Char('(') | KeyCode::Char(')') => {
-                // cycle sessions
-                if self.sessions.len() > 1 {
-                    let n = self.sessions.len();
-                    let ni = if k.code == KeyCode::Char('(') {
-                        (si + n - 1) % n
-                    } else {
-                        (si + 1) % n
-                    };
-                    let (cols, rows) = (self.sessions[si].cols, self.sessions[si].rows);
-                    let s = &mut self.sessions[ni];
-                    s.cols = cols;
-                    s.rows = rows;
-                    let name = s.name.clone();
-                    if let Some(c) = self.clients.get_mut(&cid) {
-                        c.session = name;
-                        c.frame.invalidate();
-                    }
-                    self.relayout(ni);
+                while x < t.len() && t[x].is_whitespace() {
+                    x += 1;
                 }
+                cs.cx = (x.min(t.len().saturating_sub(1))) as u16;
             }
+            KeyCode::Char('b') if !ctrl => {
+                let t: Vec<char> = row_text(&p.parser, cs.cy).chars().collect();
+                let mut x = cs.cx as usize;
+                while x > 0 && t.get(x - 1).is_some_and(|c| c.is_whitespace()) {
+                    x -= 1;
+                }
+                while x > 0 && t.get(x - 1).is_some_and(|c| !c.is_whitespace()) {
+                    x -= 1;
+                }
+                cs.cx = x as u16;
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                off = scroll_to(off + h as usize, &mut p.parser)
+            }
+            KeyCode::PageDown | KeyCode::Char('f') => {
+                off = scroll_to(off.saturating_sub(h as usize), &mut p.parser)
+            }
+            KeyCode::Char('u') => off = scroll_to(off + h as usize / 2, &mut p.parser),
             KeyCode::Char('d') => {
-                if let Some(mut c) = self.clients.remove(&cid) {
-                    let _ = write_msg(
-                        &mut c.sender,
-                        &ServerMsg::Exit(format!("detached (from session {})", c.session)),
-                    );
+                off = scroll_to(off.saturating_sub(h as usize / 2), &mut p.parser)
+            }
+            KeyCode::Char('g') => {
+                off = scroll_to(usize::MAX, &mut p.parser);
+                cs.cy = 0;
+            }
+            KeyCode::Char('G') => {
+                off = scroll_to(0, &mut p.parser);
+                cs.cy = h - 1;
+            }
+            KeyCode::Char('H') => cs.cy = 0,
+            KeyCode::Char('L') => cs.cy = h - 1,
+            KeyCode::Char('v') | KeyCode::Char(' ') => {
+                cs.line = false;
+                cs.anchor = if cs.anchor.is_some() && !cs.line {
+                    None
+                } else {
+                    Some((copy::abs_row(cs.cy, off), cs.cx))
+                };
+            }
+            KeyCode::Char('V') => {
+                cs.line = true;
+                cs.anchor = Some((copy::abs_row(cs.cy, off), cs.cx));
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if cs.anchor.is_some() {
+                    p.copy = Some(cs);
+                    self.copy_selection(cid, pid);
+                    self.mark_dirty();
+                    return;
                 }
+                done = true;
             }
             _ => {}
         }
+        if done {
+            p.copy = None;
+            p.parser.screen_mut().set_scrollback(0);
+        } else {
+            p.copy = Some(cs);
+        }
+        self.mark_dirty();
     }
 }
 
@@ -714,6 +1285,15 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             let _ = write_msg(&mut w, &ServerMsg::Text(String::new()));
             std::process::exit(0);
         }
+        Command::Run { line } => {
+            let mut st = shared.lock().unwrap();
+            let res = commands::parse(&line).and_then(|c| st.exec_global(c));
+            let msg = match res {
+                Ok(()) => ServerMsg::Text(String::new()),
+                Err(e) => ServerMsg::Error(e),
+            };
+            let _ = write_msg(&mut w, &msg);
+        }
         Command::Attach {
             session,
             create,
@@ -755,6 +1335,11 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                     sender: Box::new(w),
                     prefix: false,
                     frame: Frame::default(),
+                    prompt: None,
+                    chooser: None,
+                    popup: None,
+                    message: None,
+                    drag: None,
                 },
             );
             st.mark_dirty();
@@ -776,8 +1361,12 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
 pub fn run() -> Result<()> {
     let listener = ipc::listen()?;
     let (tx, rx) = mpsc::channel();
+    let cfg = Config::load();
+    let (bindings, _) = cfg.bindings();
     let shared: Shared = Arc::new(Mutex::new(State {
-        cfg: Config::load(),
+        cfg,
+        bindings,
+        buffer: None,
         panes: HashMap::new(),
         sessions: vec![],
         clients: HashMap::new(),
@@ -785,6 +1374,12 @@ pub fn run() -> Result<()> {
         dirty: false,
         notify: tx,
     }));
+    {
+        let mut st = shared.lock().unwrap();
+        for c in st.cfg.commands.clone() {
+            let _ = commands::parse(&c).and_then(|cmd| st.exec_global(cmd));
+        }
+    }
 
     // Render / housekeeping thread.
     let sh = shared.clone();
@@ -796,23 +1391,50 @@ pub fn run() -> Result<()> {
             std::thread::sleep(Duration::from_millis(8));
             while rx.try_recv().is_ok() {}
             let mut st = sh.lock().unwrap();
-            // detect exited children (ConPTY may not deliver EOF)
-            let dead: Vec<usize> = st
-                .panes
-                .iter_mut()
-                .filter_map(|(id, p)| matches!(p.child.try_wait(), Ok(Some(_))).then_some(*id))
-                .collect();
-            for id in dead {
-                st.pane_exited(id);
+            let tick = last_tick.elapsed() > Duration::from_millis(500);
+            if tick {
+                last_tick = Instant::now();
+                // detect exited children (ConPTY may not deliver EOF)
+                let dead: Vec<usize> = st
+                    .panes
+                    .iter_mut()
+                    .filter_map(|(id, p)| matches!(p.child.try_wait(), Ok(Some(_))).then_some(*id))
+                    .collect();
+                for id in dead {
+                    st.pane_exited(id);
+                }
+                // automatic window names
+                if st.cfg.automatic_rename {
+                    let st = &mut *st;
+                    for s in &mut st.sessions {
+                        for w in &mut s.windows {
+                            if w.manual_name {
+                                continue;
+                            }
+                            if let Some(n) =
+                                st.panes.get(&w.active).and_then(|p| p.foreground_name())
+                            {
+                                if !n.is_empty() && n != w.name {
+                                    w.name = n;
+                                    st.dirty = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                for c in st.clients.values_mut() {
+                    if c.message
+                        .as_ref()
+                        .is_some_and(|m| m.1.elapsed() > Duration::from_secs(3))
+                    {
+                        c.message = None;
+                    }
+                }
             }
             if !st.sessions.is_empty() {
                 ever_had_session = true;
             } else if ever_had_session {
                 std::process::exit(0);
-            }
-            let tick = last_tick.elapsed() > Duration::from_millis(500);
-            if tick {
-                last_tick = Instant::now();
             }
             if !st.dirty && !tick {
                 continue;
@@ -843,7 +1465,6 @@ pub fn run() -> Result<()> {
             for id in gone {
                 clients.remove(&id);
             }
-            // merge back (new clients may have been added meanwhile? no: we hold the lock)
             st.clients = clients;
         }
     });

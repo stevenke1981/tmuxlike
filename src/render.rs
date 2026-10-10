@@ -1,9 +1,10 @@
 //! Compose a session's visible state into a cell grid and diff it into ANSI output.
-use crate::server::{Client, Session, State};
+use crate::server::{Client, PromptKind, Session, State};
 use crossterm::style::{
     Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::{cursor, queue, terminal};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Cell {
@@ -58,10 +59,17 @@ impl Grid {
             self.cells[(y as usize) * self.w as usize + x as usize] = c;
         }
     }
+    /// Write text truncated to `max` display columns (CJK aware). Returns columns used.
+    #[allow(clippy::too_many_arguments)]
     fn text(&mut self, x: u16, y: u16, max: u16, s: &str, fg: Color, bg: Color, attrs: u8) -> u16 {
         let mut cx = x;
+        let limit = (x as u32 + max as u32).min(self.w as u32) as u16;
         for ch in s.chars() {
-            if cx >= x + max || cx >= self.w {
+            let cw = ch.width().unwrap_or(0) as u16;
+            if cw == 0 {
+                continue;
+            }
+            if cx + cw > limit {
                 break;
             }
             self.put(
@@ -72,14 +80,59 @@ impl Grid {
                     fg,
                     bg,
                     attrs,
-                    wide: false,
+                    wide: cw == 2,
                     skip: false,
                 },
             );
-            cx += 1;
+            if cw == 2 {
+                self.put(
+                    cx + 1,
+                    y,
+                    Cell {
+                        s: String::new(),
+                        fg,
+                        bg,
+                        attrs,
+                        wide: false,
+                        skip: true,
+                    },
+                );
+            }
+            cx += cw;
         }
         cx - x
     }
+}
+
+/// Truncate to a display width, appending '…' if cut.
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw + 1 > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Entries for the session/window chooser: (session index, window index or None for the session row)
+pub fn chooser_entries(st: &State) -> Vec<(usize, Option<usize>)> {
+    let mut v = vec![];
+    for (si, s) in st.sessions.iter().enumerate() {
+        v.push((si, None));
+        for wi in 0..s.windows.len() {
+            v.push((si, Some(wi)));
+        }
+    }
+    v
 }
 
 fn conv(c: vt100::Color) -> Color {
@@ -103,7 +156,7 @@ fn status_labels(s: &Session) -> Vec<(usize, u16, u16, String)> {
             " "
         };
         let label = format!("{}:{}{}", i, w.name, flag);
-        let len = label.chars().count() as u16;
+        let len = label.width() as u16;
         v.push((i, x, x + len, label));
         x += len + 1;
     }
@@ -134,6 +187,11 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
     for (pid, r) in &rects {
         let Some(p) = st.panes.get(pid) else { continue };
         let screen = p.parser.screen();
+        let off = screen.scrollback();
+        let sel = p.copy.as_ref().and_then(|c| {
+            c.anchor
+                .map(|a| (a, (crate::copy::abs_row(c.cy, off), c.cx), c.line))
+        });
         for row in 0..r.h {
             for col in 0..r.w {
                 let (x, y) = (r.x + col, r.y + row);
@@ -157,6 +215,12 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                 if cell.inverse() {
                     attrs |= INVERSE;
                 }
+                if let Some((a, b, line)) = sel {
+                    if crate::copy::in_selection(a, b, line, (crate::copy::abs_row(row, off), col))
+                    {
+                        attrs ^= INVERSE;
+                    }
+                }
                 let txt = cell.contents();
                 g.put(
                     x,
@@ -176,12 +240,21 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                 );
             }
         }
-        if p.copy {
-            let label = format!("[scroll {}/{}]", screen.scrollback(), st.cfg.scrollback);
+        if let Some(cs) = &p.copy {
+            let label = format!(
+                "[copy {}/{}{}]",
+                screen.scrollback(),
+                st.cfg.scrollback,
+                if cs.anchor.is_some() { " sel" } else { "" }
+            );
             let lx = r.x + r.w.saturating_sub(label.len() as u16);
             g.text(lx, r.y, r.w, &label, Color::Black, Color::Yellow, 0);
         }
-        if *pid == win.active && !p.copy && !screen.hide_cursor() {
+        if let Some(cs) = &p.copy {
+            if *pid == win.active {
+                cursor_pos = Some((r.x + cs.cx, r.y + cs.cy));
+            }
+        } else if *pid == win.active && !screen.hide_cursor() {
             let (cy, cx) = screen.cursor_position();
             if cx < r.w && cy < r.h {
                 cursor_pos = Some((r.x + cx, r.y + cy));
@@ -321,6 +394,7 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
 
     // status bar
     let sy = h - 1;
+    let mut cursor_pos = cursor_pos;
     for x in 0..w {
         g.put(
             x,
@@ -360,7 +434,7 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
     } else {
         format!(" {} | tmuxlike ", st.cfg.prefix)
     };
-    let rl = right.chars().count() as u16;
+    let rl = right.width() as u16;
     if w > rl {
         let (fg, bg) = if c.prefix {
             (Color::Black, Color::Yellow)
@@ -368,6 +442,174 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
             (Color::Black, Color::Green)
         };
         g.text(w - rl, sy, rl, &right, fg, bg, 0);
+    }
+
+    if let Some(p) = &c.prompt {
+        let label = match p.kind {
+            PromptKind::Command => ":".to_string(),
+            PromptKind::RenameWindow => "(rename-window) ".into(),
+            PromptKind::RenameSession => "(rename-session) ".into(),
+        };
+        for x in 0..w {
+            g.put(
+                x,
+                sy,
+                Cell {
+                    bg: Color::Yellow,
+                    fg: Color::Black,
+                    ..Cell::default()
+                },
+            );
+        }
+        let text = format!("{label}{}", p.buf);
+        // keep the end of the input visible
+        let mut shown = text.as_str();
+        while shown.width() as u16 >= w && !shown.is_empty() {
+            let mut it = shown.chars();
+            it.next();
+            shown = it.as_str();
+        }
+        let used = g.text(0, sy, w, shown, Color::Black, Color::Yellow, 0);
+        cursor_pos = Some((used.min(w - 1), sy));
+    } else if let Some((m, _)) = &c.message {
+        for x in 0..w {
+            g.put(
+                x,
+                sy,
+                Cell {
+                    bg: Color::Yellow,
+                    fg: Color::Black,
+                    ..Cell::default()
+                },
+            );
+        }
+        g.text(0, sy, w, m, Color::Black, Color::Yellow, 0);
+    }
+
+    // overlays
+    let overlay =
+        |g: &mut Grid, title: &str, lines: &[(String, bool)], sel: Option<usize>, scroll: usize| {
+            let bw = (lines
+                .iter()
+                .map(|l| l.0.width())
+                .max()
+                .unwrap_or(10)
+                .max(title.width()) as u16
+                + 4)
+            .min(w.saturating_sub(2))
+            .max(10);
+            let maxh = h.saturating_sub(3).max(3);
+            let bh = (lines.len() as u16 + 2).min(maxh);
+            let bx = w.saturating_sub(bw) / 2;
+            let by = h.saturating_sub(1).saturating_sub(bh) / 2;
+            let inner = (bh - 2) as usize;
+            let start = sel
+                .map(|s| s.saturating_sub(inner.saturating_sub(1)))
+                .unwrap_or(scroll.min(lines.len().saturating_sub(inner)));
+            for yy in 0..bh {
+                for xx in 0..bw {
+                    let edge = yy == 0 || yy == bh - 1 || xx == 0 || xx == bw - 1;
+                    let ch = match (yy, xx) {
+                        (0, 0) => "┌",
+                        (0, x) if x == bw - 1 => "┐",
+                        (y, 0) if y == bh - 1 => "└",
+                        (y, x) if y == bh - 1 && x == bw - 1 => "┘",
+                        (0, _) | (_, _) if edge && (yy == 0 || yy == bh - 1) => "─",
+                        _ if edge => "│",
+                        _ => " ",
+                    };
+                    g.put(
+                        bx + xx,
+                        by + yy,
+                        Cell {
+                            s: ch.into(),
+                            fg: Color::Cyan,
+                            ..Cell::default()
+                        },
+                    );
+                }
+            }
+            g.text(
+                bx + 2,
+                by,
+                bw.saturating_sub(4),
+                &format!(" {title} "),
+                Color::Cyan,
+                Color::Reset,
+                BOLD,
+            );
+            for (i, (l, bold)) in lines.iter().enumerate().skip(start).take(inner) {
+                let y = by + 1 + (i - start) as u16;
+                let selected = sel == Some(i);
+                let (fg, bg) = if selected {
+                    (Color::Black, Color::Cyan)
+                } else {
+                    (Color::Reset, Color::Reset)
+                };
+                if selected {
+                    for xx in 1..bw - 1 {
+                        g.put(
+                            bx + xx,
+                            y,
+                            Cell {
+                                bg,
+                                ..Cell::default()
+                            },
+                        );
+                    }
+                }
+                let t = truncate(l, (bw - 4) as usize);
+                g.text(bx + 2, y, bw - 4, &t, fg, bg, if *bold { BOLD } else { 0 });
+            }
+        };
+    if let Some(sel) = c.chooser {
+        let lines: Vec<(String, bool)> = chooser_entries(st)
+            .into_iter()
+            .map(|(si, wi)| {
+                let ss = &st.sessions[si];
+                match wi {
+                    None => (
+                        format!(
+                            "{}: {} windows{}",
+                            ss.name,
+                            ss.windows.len(),
+                            if ss.name == s.name { " (attached)" } else { "" }
+                        ),
+                        true,
+                    ),
+                    Some(wi) => {
+                        let wn = &ss.windows[wi];
+                        let busy = wn
+                            .panes()
+                            .iter()
+                            .any(|p| st.panes.get(p).is_some_and(|p| p.busy(&st.cfg)));
+                        (
+                            format!(
+                                "  ├─ {}: {} [{} panes]{}{}",
+                                wi,
+                                wn.name,
+                                wn.panes().len(),
+                                if wi == ss.active { " *" } else { "" },
+                                if busy { " ●" } else { "" }
+                            ),
+                            false,
+                        )
+                    }
+                }
+            })
+            .collect();
+        overlay(
+            &mut g,
+            "choose session/window — ↑↓ Enter, x kill, Esc",
+            &lines,
+            Some(sel),
+            0,
+        );
+        cursor_pos = None;
+    } else if let Some((p, scroll)) = &c.popup {
+        let lines: Vec<(String, bool)> = p.iter().map(|l| (l.clone(), false)).collect();
+        overlay(&mut g, "keys", &lines, None, *scroll);
+        cursor_pos = None;
     }
 
     Some(emit(&mut c.frame, g, cursor_pos))

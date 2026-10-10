@@ -16,6 +16,10 @@ pub enum Command {
         session: String,
     },
     KillServer,
+    /// Run a server command (source-file, set, bind-key ...)
+    Run {
+        line: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

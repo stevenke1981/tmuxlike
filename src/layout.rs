@@ -131,7 +131,7 @@ impl Node {
         false
     }
 
-    /// Grow (delta>0) or shrink the target along `dir` using the nearest enclosing split.
+    /// Move the border of the nearest enclosing split along `dir` by `delta` (fraction; + = right/down).
     pub fn resize(&mut self, target: usize, dir: Dir, delta: f32) -> bool {
         if let Node::Split {
             dir: d,
@@ -150,7 +150,7 @@ impl Node {
                 return true;
             }
             if *d == dir {
-                *ratio = (*ratio + if in_a { delta } else { -delta }).clamp(0.05, 0.95);
+                *ratio = (*ratio + delta).clamp(0.05, 0.95);
                 return true;
             }
         }

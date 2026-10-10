@@ -1,5 +1,7 @@
 mod client;
+mod commands;
 mod config;
+mod copy;
 mod ipc;
 mod keys;
 mod layout;
@@ -18,7 +20,9 @@ USAGE:
   tmuxlike ls                    list sessions
   tmuxlike kill-session -t NAME  kill a session
   tmuxlike kill-server           kill the server and all sessions
-  tmuxlike keys                  show key bindings
+  tmuxlike keys                  show default key bindings
+  tmuxlike source-file [PATH]    reload config in the running server
+  tmuxlike <command> [args]      run any server command, e.g. `tmuxlike set mouse off`
 
 Config: $TMUXLIKE_CONFIG or <config_dir>/tmuxlike/config.toml";
 
@@ -29,11 +33,14 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
   Ctrl/Alt+arrows, H J K L  resize pane
   o          next pane            z          zoom pane
   x          kill pane            &          kill window
-  [ / PgUp   scroll mode (Up/Down/PgUp/PgDn/g/G, q to exit)
-  a  or b    toggle status sidebar (agents / panes)
-  s  or ( )  switch session       d          detach
+  [ / PgUp   copy mode (hjkl, v/V select, y copy, q exit)
+  ]          paste buffer         :          command prompt
+  ,          rename window        $          rename session
+  s / w      session chooser      ( )        prev/next session
+  a  or b    toggle sidebar       r          reload config
+  ?          list keys            d          detach
   Ctrl-b     send prefix to the program
-Mouse: click to focus pane / select window in status bar, wheel to scroll.";
+Mouse: click to focus pane / select window in status bar, wheel to scroll, drag to copy.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
 
 fn flag(args: &[String], f: &str) -> Option<String> {
     args.iter()
@@ -63,9 +70,27 @@ fn main() {
             println!("tmuxlike {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => {
+        "-h" | "--help" | "help" => {
             println!("{HELP}");
             Ok(())
+        }
+        _ => {
+            // any other tmux-style command is sent to the running server (e.g. source-file, set, bind-key)
+            let line = args
+                .iter()
+                .map(|a| {
+                    if a.contains(' ') {
+                        format!("\"{a}\"")
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            match commands::parse(&line) {
+                Ok(_) => client::simple(Command::Run { line }),
+                Err(e) => Err(anyhow::anyhow!("{e}\n\n{HELP}")),
+            }
         }
     };
     if let Err(e) = res {
