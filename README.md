@@ -47,6 +47,9 @@ tmuxlike ls                     # 列出 sessions / list sessions
 tmuxlike kill-session -t work   # 關閉 session
 tmuxlike kill-server            # 關閉伺服器與所有 session
 tmuxlike keys                   # 顯示快捷鍵 / show key bindings
+tmuxlike new -d -s bg           # 在背景建立 session / create a session without attaching
+tmuxlike send-keys -t bg 'echo hi' Enter   # 輸入文字或按鍵 / type text or keys
+tmuxlike capture-pane -p -t bg  # 印出窗格內容 / print the pane's visible text
 tmuxlike source-file            # 重新載入設定 / reload config in the running server
 tmuxlike set mouse off          # 任何伺服器指令皆可從命令列執行 / run any server command from the shell
 ```
@@ -161,9 +164,14 @@ A `.toml` file replaces the whole config; any other file is run line by line as 
 - 窗格內程式的滑鼠事件不會轉送（滾輪在全螢幕程式中轉為方向鍵）/ Mouse events are not forwarded to apps (wheel becomes arrow keys in full-screen apps)
 - 終端模擬由 `vt100` crate 提供，少數進階序列可能不支援 / Terminal emulation via the `vt100` crate; some advanced sequences may be unsupported
 
+## 疑難排解 Troubleshooting
+
+設定 `TMUXLIKE_LOG=路徑` 後啟動，伺服器會寫入除錯紀錄（窗格啟動、讀到的輸出等）。
+Set `TMUXLIKE_LOG=/path/to/file` before starting to get a server debug log (pane spawns, pty output, etc).
+
 ## 測試 Testing
 
-`cargo test`（單元測試 unit tests）與 `python3 scripts/e2e_linux.py`（需 `pip install pyte`，在 Linux 上以虛擬終端驅動實際操作 / drives a real session through a pty on Linux）。
+`cargo test`（單元測試 unit tests）、`python scripts/smoke.py`（CI 在 Linux / macOS / Windows 上執行：背景 session、確認 PowerShell/shell 提示字元、send-keys、ANSI 畫面 / runs on all three OSes in CI）與 `python3 scripts/e2e_linux.py`（需 `pip install pyte`，在 Linux 上以虛擬終端驅動實際操作 / drives a real session through a pty on Linux）。
 
 ## License
 
