@@ -1,9 +1,16 @@
 //! Compose a session's visible state into a cell grid and diff it into ANSI output.
 use crate::server::{Client, PromptKind, Session, State};
-use crossterm::style::{
-    Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
-use crossterm::{cursor, queue, terminal};
+use crossterm::style::{Attribute, Color, Print, SetAttribute};
+use crossterm::{cursor, terminal};
+
+/// Always emit ANSI text. crossterm's `queue!` falls back to calling the WinAPI on Windows
+/// when the process has no VT-capable console — and the server is a detached process with
+/// no console at all — which silently produced frames without any escape sequences.
+macro_rules! ansi {
+    ($out:expr, $($c:expr),+ $(,)?) => {{
+        $( let _ = crossterm::Command::write_ansi(&$c, &mut $out); )+
+    }};
+}
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -615,12 +622,38 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
     Some(emit(&mut c.frame, g, cursor_pos))
 }
 
+/// SGR for a colour, written by hand so NO_COLOR or platform quirks never drop it.
+fn sgr_color(c: Color, fg: bool) -> String {
+    let base = |n: u8| format!("\x1b[{}m", if fg { n } else { n + 10 });
+    match c {
+        Color::Reset => base(39),
+        Color::Black => base(30),
+        Color::DarkRed => base(31),
+        Color::DarkGreen => base(32),
+        Color::DarkYellow => base(33),
+        Color::DarkBlue => base(34),
+        Color::DarkMagenta => base(35),
+        Color::DarkCyan => base(36),
+        Color::Grey => base(37),
+        Color::DarkGrey => base(90),
+        Color::Red => base(91),
+        Color::Green => base(92),
+        Color::Yellow => base(93),
+        Color::Blue => base(94),
+        Color::Magenta => base(95),
+        Color::Cyan => base(96),
+        Color::White => base(97),
+        Color::AnsiValue(i) => format!("\x1b[{};5;{}m", if fg { 38 } else { 48 }, i),
+        Color::Rgb { r, g, b } => format!("\x1b[{};2;{};{};{}m", if fg { 38 } else { 48 }, r, g, b),
+    }
+}
+
 fn emit(frame: &mut Frame, g: Grid, cursor_pos: Option<(u16, u16)>) -> String {
-    let mut out: Vec<u8> = Vec::new();
+    let mut out = String::new();
     let full = frame.w != g.w || frame.h != g.h || frame.cells.len() != g.cells.len();
-    let _ = queue!(out, terminal::BeginSynchronizedUpdate, cursor::Hide);
+    ansi!(out, terminal::BeginSynchronizedUpdate, cursor::Hide);
     if full {
-        let _ = queue!(
+        ansi!(
             out,
             SetAttribute(Attribute::Reset),
             terminal::Clear(terminal::ClearType::All)
@@ -643,35 +676,35 @@ fn emit(frame: &mut Frame, g: Grid, cursor_pos: Option<(u16, u16)>) -> String {
             }
             changed = true;
             if pos != Some((x, y)) {
-                let _ = queue!(out, cursor::MoveTo(x, y));
+                ansi!(out, cursor::MoveTo(x, y));
             }
             if cur_attrs != Some(c.attrs) {
-                let _ = queue!(out, SetAttribute(Attribute::Reset));
+                ansi!(out, SetAttribute(Attribute::Reset));
                 if c.attrs & BOLD != 0 {
-                    let _ = queue!(out, SetAttribute(Attribute::Bold));
+                    ansi!(out, SetAttribute(Attribute::Bold));
                 }
                 if c.attrs & ITALIC != 0 {
-                    let _ = queue!(out, SetAttribute(Attribute::Italic));
+                    ansi!(out, SetAttribute(Attribute::Italic));
                 }
                 if c.attrs & UNDER != 0 {
-                    let _ = queue!(out, SetAttribute(Attribute::Underlined));
+                    ansi!(out, SetAttribute(Attribute::Underlined));
                 }
                 if c.attrs & INVERSE != 0 {
-                    let _ = queue!(out, SetAttribute(Attribute::Reverse));
+                    ansi!(out, SetAttribute(Attribute::Reverse));
                 }
                 cur_attrs = Some(c.attrs);
                 cur_fg = None;
                 cur_bg = None;
             }
             if cur_fg != Some(c.fg) {
-                let _ = queue!(out, SetForegroundColor(c.fg));
+                out.push_str(&sgr_color(c.fg, true));
                 cur_fg = Some(c.fg);
             }
             if cur_bg != Some(c.bg) {
-                let _ = queue!(out, SetBackgroundColor(c.bg));
+                out.push_str(&sgr_color(c.bg, false));
                 cur_bg = Some(c.bg);
             }
-            let _ = queue!(out, Print(&c.s));
+            ansi!(out, Print(&c.s));
             let adv = if c.wide { 2 } else { 1 };
             pos = if x + adv < g.w {
                 Some((x + adv, y))
@@ -680,14 +713,36 @@ fn emit(frame: &mut Frame, g: Grid, cursor_pos: Option<(u16, u16)>) -> String {
             };
         }
     }
-    let _ = queue!(out, SetAttribute(Attribute::Reset));
+    ansi!(out, SetAttribute(Attribute::Reset));
     if let Some((x, y)) = cursor_pos {
-        let _ = queue!(out, cursor::MoveTo(x, y), cursor::Show);
+        ansi!(out, cursor::MoveTo(x, y), cursor::Show);
     }
-    let _ = queue!(out, terminal::EndSynchronizedUpdate);
+    ansi!(out, terminal::EndSynchronizedUpdate);
     let _ = changed;
     frame.w = g.w;
     frame.h = g.h;
     frame.cells = g.cells;
-    String::from_utf8(out).unwrap_or_default()
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn emit_is_ansi_on_every_platform() {
+        let mut g = Grid {
+            w: 6,
+            h: 2,
+            cells: vec![Cell::default(); 12],
+        };
+        g.text(0, 1, 6, "ab", Color::Black, Color::Green, BOLD);
+        g.text(3, 0, 3, "中", Color::Reset, Color::Reset, 0);
+        let mut f = Frame::default();
+        let out = emit(&mut f, g, Some((1, 0)));
+        assert!(out.contains("\x1b[2;1H"), "{out:?}"); // MoveTo(0,1)
+        assert!(out.contains("\x1b[102m"), "{out:?}");
+        assert!(out.contains("中"));
+        assert!(out.ends_with("\x1b[?2026l"), "{out:?}");
+        assert_eq!(truncate("中文名稱很長", 7), "中文名…");
+    }
 }

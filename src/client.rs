@@ -69,6 +69,35 @@ pub fn simple(cmd: Command) -> Result<()> {
     }
 }
 
+/// `new -d`: create a session in the background and return.
+pub fn new_detached(session: Option<String>) -> Result<()> {
+    let s = connect(true)?;
+    let (mut r, mut w) = s.split();
+    let (cols, rows) = terminal::size().unwrap_or((120, 30));
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    write_msg(
+        &mut w,
+        &ClientMsg::Hello(Command::Attach {
+            session,
+            create: true,
+            cols,
+            rows,
+            cwd,
+            detached: true,
+        }),
+    )?;
+    match read_msg::<ServerMsg>(&mut r)? {
+        ServerMsg::Error(e) => Err(anyhow!(e)),
+        ServerMsg::Text(t) => {
+            print!("{t}");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn attach(session: Option<String>, create: bool) -> Result<()> {
     if std::env::var_os("TMUXLIKE").is_some() {
         return Err(anyhow!(
@@ -89,6 +118,7 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
             cols,
             rows,
             cwd,
+            detached: false,
         }),
     )?;
 

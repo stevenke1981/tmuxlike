@@ -15,12 +15,14 @@ const HELP: &str = "tmuxlike - a cross-platform terminal multiplexer
 
 USAGE:
   tmuxlike                       attach to the last session, or create one
-  tmuxlike new [-s NAME]         create a new session and attach
+  tmuxlike new [-d] [-s NAME]    create a new session and attach (-d: in background)
   tmuxlike attach [-t NAME]      attach to an existing session (alias: a)
   tmuxlike ls                    list sessions
   tmuxlike kill-session -t NAME  kill a session
   tmuxlike kill-server           kill the server and all sessions
   tmuxlike keys                  show default key bindings
+  tmuxlike capture-pane -p [-t S] print the active pane of a session
+  tmuxlike send-keys [-t S] KEYS  type text / keys (Enter, C-c, ...) into it
   tmuxlike source-file [PATH]    reload config in the running server
   tmuxlike <command> [args]      run any server command, e.g. `tmuxlike set mouse off`
 
@@ -54,6 +56,9 @@ fn main() {
     let res = match sub {
         "__server" => server::run(),
         "" => client::attach(None, false).or_else(|_| client::attach(None, true)),
+        "new" | "new-session" if args.iter().any(|a| a == "-d") => {
+            client::new_detached(flag(&args, "-s"))
+        }
         "new" | "new-session" => client::attach(flag(&args, "-s"), true),
         "attach" | "a" | "attach-session" => client::attach(flag(&args, "-t"), false),
         "ls" | "list-sessions" => client::simple(Command::List),

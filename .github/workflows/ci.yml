@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
 jobs:
   build:
@@ -16,3 +16,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - run: cargo test
+      - name: Smoke test (real pty / ConPTY session)
+        run: python scripts/smoke.py

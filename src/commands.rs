@@ -4,8 +4,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
-    SplitWindow { horizontal: bool },
-    NewWindow { name: Option<String> },
+    SplitWindow {
+        horizontal: bool,
+    },
+    NewWindow {
+        name: Option<String>,
+    },
     RenameWindow(Option<String>),
     RenameSession(Option<String>),
     KillPane,
@@ -19,7 +23,9 @@ pub enum Cmd {
     NextWindow,
     PrevWindow,
     SelectWindow(usize),
-    CopyMode { page_up: bool },
+    CopyMode {
+        page_up: bool,
+    },
     PasteBuffer,
     Detach,
     ChooseTree,
@@ -29,10 +35,24 @@ pub enum Cmd {
     BindKey(String, String),
     UnbindKey(String),
     CommandPrompt,
-    SwitchClient { next: bool },
+    SwitchClient {
+        next: bool,
+    },
     SendPrefix,
     DisplayMessage(String),
     ListKeys,
+    DebugFrame {
+        target: Option<String>,
+    },
+    CapturePane {
+        target: Option<String>,
+        print: bool,
+    },
+    SendKeys {
+        target: Option<String>,
+        literal: bool,
+        keys: Vec<String>,
+    },
 }
 
 /// Split a command line into words, honouring '...' "..." and backslash escapes.
@@ -230,8 +250,70 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "send-prefix" => Cmd::SendPrefix,
         "display-message" | "display" => Cmd::DisplayMessage(rest().unwrap_or_default()),
         "list-keys" | "lsk" => Cmd::ListKeys,
+        "debug-frame" => Cmd::DebugFrame {
+            target: flag_val(args, "-t"),
+        },
+        "capture-pane" | "capturep" => Cmd::CapturePane {
+            target: flag_val(args, "-t"),
+            print: has("-p"),
+        },
+        "send-keys" | "send" => Cmd::SendKeys {
+            target: flag_val(args, "-t"),
+            literal: has("-l"),
+            keys: positional(args, &["-t"]),
+        },
         other => return Err(format!("unknown command: {other}")),
     })
+}
+
+/// Bytes for one `send-keys` argument: a key name (Enter, C-c, Up, ...) or literal text.
+pub fn send_key_bytes(arg: &str, literal: bool) -> Vec<u8> {
+    if !literal && arg.chars().count() > 1 {
+        if let Ok(n) = normalize_key(arg) {
+            let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
+            loop {
+                if let Some(r) = rest.strip_prefix("C-") {
+                    mods |= KeyModifiers::CONTROL;
+                    rest = r;
+                } else if let Some(r) = rest.strip_prefix("M-") {
+                    mods |= KeyModifiers::ALT;
+                    rest = r;
+                } else if let Some(r) = rest.strip_prefix("S-") {
+                    mods |= KeyModifiers::SHIFT;
+                    rest = r;
+                } else {
+                    break;
+                }
+            }
+            let code = match rest {
+                "Space" => Some(KeyCode::Char(' ')),
+                "Enter" => Some(KeyCode::Enter),
+                "Tab" => Some(KeyCode::Tab),
+                "BTab" => Some(KeyCode::BackTab),
+                "Escape" => Some(KeyCode::Esc),
+                "BSpace" => Some(KeyCode::Backspace),
+                "Up" => Some(KeyCode::Up),
+                "Down" => Some(KeyCode::Down),
+                "Left" => Some(KeyCode::Left),
+                "Right" => Some(KeyCode::Right),
+                "Home" => Some(KeyCode::Home),
+                "End" => Some(KeyCode::End),
+                "PageUp" => Some(KeyCode::PageUp),
+                "PageDown" => Some(KeyCode::PageDown),
+                "Insert" => Some(KeyCode::Insert),
+                "Delete" => Some(KeyCode::Delete),
+                f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
+                    Some(KeyCode::F(f[1..].parse().unwrap()))
+                }
+                c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
+                _ => None,
+            };
+            if let Some(code) = code {
+                return crate::keys::encode(&KeyEvent::new(code, mods), false);
+            }
+        }
+    }
+    arg.as_bytes().to_vec()
 }
 
 /// Canonical key name for an event, e.g. "c", "%", "C-a", "M-Left", "PageUp".
@@ -485,6 +567,30 @@ mod tests {
             assert!(parse(c).is_ok(), "{c}");
             assert_eq!(&normalize_key(k).unwrap(), k);
         }
+    }
+
+    #[test]
+    fn send_keys() {
+        assert_eq!(send_key_bytes("Enter", false), b"\r");
+        assert_eq!(send_key_bytes("C-c", false), vec![3]);
+        assert_eq!(send_key_bytes("echo hi", false), b"echo hi");
+        assert_eq!(send_key_bytes("Enter", true), b"Enter");
+        assert_eq!(send_key_bytes("x", false), b"x");
+        assert_eq!(
+            parse("send-keys -t s1 'echo ok' Enter").unwrap(),
+            Cmd::SendKeys {
+                target: Some("s1".into()),
+                literal: false,
+                keys: vec!["echo ok".into(), "Enter".into()]
+            }
+        );
+        assert_eq!(
+            parse("capture-pane -p -t x").unwrap(),
+            Cmd::CapturePane {
+                target: Some("x".into()),
+                print: true
+            }
+        );
     }
 
     #[test]

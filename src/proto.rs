@@ -10,6 +10,9 @@ pub enum Command {
         cols: u16,
         rows: u16,
         cwd: Option<String>,
+        /// create the session without attaching (new -d)
+        #[serde(default)]
+        detached: bool,
     },
     List,
     Kill {

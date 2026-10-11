@@ -581,6 +581,38 @@ impl State {
         }
     }
 
+    fn target_session(&self, target: Option<&str>) -> Result<usize, String> {
+        match target {
+            Some(t) => {
+                let name = t.split([':', '.']).next().unwrap_or(t);
+                self.sidx(name)
+                    .ok_or_else(|| format!("can't find session: {name}"))
+            }
+            None => self
+                .sessions
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, s)| s.last_used)
+                .map(|(i, _)| i)
+                .ok_or_else(|| "no sessions".to_string()),
+        }
+    }
+
+    /// Visible text of the active pane of a session (like `tmux capture-pane -p`).
+    pub fn capture(&self, target: Option<&str>) -> Result<String, String> {
+        let si = self.target_session(target)?;
+        let p = self.panes.get(&self.active_pane(si)).ok_or("no pane")?;
+        let mut out = String::new();
+        for line in p.parser.screen().contents().lines() {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        Ok(out)
+    }
+
     /// Commands that do not need a client/session.
     fn exec_global(&mut self, cmd: Cmd) -> Result<(), String> {
         match cmd {
@@ -606,6 +638,23 @@ impl State {
             }
             Cmd::SourceFile(p) => {
                 self.reload_config(p.as_deref())?;
+            }
+            Cmd::SendKeys {
+                target,
+                literal,
+                keys,
+            } => {
+                let si = self.target_session(target.as_deref())?;
+                let pid = self.active_pane(si);
+                let bytes: Vec<u8> = keys
+                    .iter()
+                    .flat_map(|k| commands::send_key_bytes(k, literal))
+                    .collect();
+                self.write_pane(pid, &bytes);
+            }
+            Cmd::CapturePane { target, .. } => {
+                let text = self.capture(target.as_deref())?;
+                self.buffer = Some(text);
             }
             other => return Err(format!("{other:?}: needs an attached client")),
         }
@@ -1287,9 +1336,30 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
         }
         Command::Run { line } => {
             let mut st = shared.lock().unwrap();
-            let res = commands::parse(&line).and_then(|c| st.exec_global(c));
+            let res = commands::parse(&line).and_then(|c| match c {
+                Cmd::CapturePane {
+                    target,
+                    print: true,
+                } => st.capture(target.as_deref()),
+                Cmd::DebugFrame { target } => {
+                    let si = st.target_session(target.as_deref())?;
+                    let mut c = Client {
+                        session: st.sessions[si].name.clone(),
+                        sender: Box::new(std::io::sink()),
+                        prefix: false,
+                        frame: Frame::default(),
+                        prompt: None,
+                        chooser: None,
+                        popup: None,
+                        message: None,
+                        drag: None,
+                    };
+                    Ok(render_client(&st, &mut c).unwrap_or_default())
+                }
+                c => st.exec_global(c).map(|_| String::new()),
+            });
             let msg = match res {
-                Ok(()) => ServerMsg::Text(String::new()),
+                Ok(t) => ServerMsg::Text(t),
                 Err(e) => ServerMsg::Error(e),
             };
             let _ = write_msg(&mut w, &msg);
@@ -1300,6 +1370,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             cols,
             rows,
             cwd,
+            detached,
         } => {
             let mut st = shared.lock().unwrap();
             let name = match session {
@@ -1321,6 +1392,10 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                 }
             };
             let si = st.sidx(&name).unwrap();
+            if detached {
+                let _ = write_msg(&mut w, &ServerMsg::Text(String::new()));
+                return;
+            }
             {
                 let s = &mut st.sessions[si];
                 s.cols = cols.max(10);
