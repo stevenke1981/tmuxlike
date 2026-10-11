@@ -17,4 +17,5 @@ jobs:
       - run: cargo build --release
       - run: cargo test
       - name: Smoke test (real pty / ConPTY session)
+        timeout-minutes: 5
         run: python scripts/smoke.py

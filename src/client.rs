@@ -17,6 +17,21 @@ fn spawn_server() -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // std spawns with bInheritHandles=TRUE, so the server would inherit our own
+        // stdin/stdout/stderr if they are inheritable (e.g. pipes from a script),
+        // keeping them open forever. Make them non-inheritable first.
+        unsafe {
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+            use windows_sys::Win32::System::Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let handle = GetStdHandle(h);
+                if !handle.is_null() {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
         // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
         cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
