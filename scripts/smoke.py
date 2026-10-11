@@ -8,7 +8,11 @@ Usage: python scripts/smoke.py [path-to-tmuxlike]
 import os, subprocess, sys, time, re
 
 exe = sys.argv[1] if len(sys.argv) > 1 else os.path.join("target", "release", "tmuxlike" + (".exe" if os.name == "nt" else ""))
-env = dict(os.environ, TMUXLIKE_SOCKET="tmuxlike-smoke-%d.sock" % os.getpid())
+import tempfile
+LOG = os.path.join(tempfile.gettempdir(), "tmuxlike-smoke.log")
+if os.path.exists(LOG):
+    os.remove(LOG)
+env = dict(os.environ, TMUXLIKE_SOCKET="tmuxlike-smoke-%d.sock" % os.getpid(), TMUXLIKE_LOG=LOG)
 env.pop("TMUXLIKE", None)
 win = os.name == "nt"
 
@@ -52,3 +56,6 @@ try:
     print("PASS")
 finally:
     tl("kill-server", check=False)
+    if os.path.exists(LOG):
+        print("---- server log ----")
+        print(open(LOG, encoding="utf-8", errors="replace").read()[-6000:])

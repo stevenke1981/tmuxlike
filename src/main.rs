@@ -1,3 +1,16 @@
+/// Append a line to $TMUXLIKE_LOG (if set). Used to diagnose the detached server.
+#[macro_export]
+macro_rules! log {
+    ($($t:tt)*) => {{
+        if let Some(p) = std::env::var_os("TMUXLIKE_LOG") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), format!($($t)*));
+            }
+        }
+    }};
+}
+
 mod client;
 mod commands;
 mod config;

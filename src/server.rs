@@ -218,7 +218,12 @@ impl State {
         } else if let Some(h) = dirs::home_dir() {
             cmd.cwd(h);
         }
-        let child = pair.slave.spawn_command(cmd).map_err(|e| anyhow!("{e}"))?;
+        crate::log!("pane {id}: spawning {shell:?} {}x{}", size.cols, size.rows);
+        let child = pair.slave.spawn_command(cmd).map_err(|e| {
+            crate::log!("pane {id}: spawn failed: {e}");
+            anyhow!("{e}")
+        })?;
+        crate::log!("pane {id}: spawned pid {:?}", child.process_id());
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("{e}"))?;
         let writer = pair.master.take_writer().map_err(|e| anyhow!("{e}"))?;
@@ -241,15 +246,43 @@ impl State {
         let shared = shared.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
+            let mut logged = 0usize;
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        crate::log!("pane {id}: EOF");
+                        break;
+                    }
+                    Err(e) => {
+                        crate::log!("pane {id}: read error {e}");
+                        break;
+                    }
                     Ok(n) => {
+                        if logged < 8 {
+                            logged += 1;
+                            crate::log!(
+                                "pane {id}: read {n} bytes: {:?}",
+                                String::from_utf8_lossy(&buf[..n.min(300)])
+                            );
+                        }
                         let mut st = shared.lock().unwrap();
                         let Some(p) = st.panes.get_mut(&id) else {
                             return;
                         };
                         p.parser.process(&buf[..n]);
+                        // Answer terminal queries (ConPTY and many apps block waiting for these).
+                        let replies = crate::keys::query_replies(
+                            &buf[..n],
+                            p.parser.screen().cursor_position(),
+                        );
+                        if !replies.is_empty() {
+                            crate::log!(
+                                "pane {id}: answering queries {:?}",
+                                String::from_utf8_lossy(&replies)
+                            );
+                            let _ = p.writer.write_all(&replies);
+                            let _ = p.writer.flush();
+                        }
                         p.last_output = Instant::now();
                         p.attention = true;
                         st.dirty = true;
@@ -1434,7 +1467,8 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
 }
 
 pub fn run() -> Result<()> {
-    let listener = ipc::listen()?;
+    crate::log!("server starting, pid {}", std::process::id());
+    let listener = ipc::listen().inspect_err(|e| crate::log!("listen failed: {e}"))?;
     let (tx, rx) = mpsc::channel();
     let cfg = Config::load();
     let (bindings, _) = cfg.bindings();
@@ -1473,7 +1507,13 @@ pub fn run() -> Result<()> {
                 let dead: Vec<usize> = st
                     .panes
                     .iter_mut()
-                    .filter_map(|(id, p)| matches!(p.child.try_wait(), Ok(Some(_))).then_some(*id))
+                    .filter_map(|(id, p)| match p.child.try_wait() {
+                        Ok(Some(status)) => {
+                            crate::log!("pane {id}: child exited {status:?}");
+                            Some(*id)
+                        }
+                        _ => None,
+                    })
                     .collect();
                 for id in dead {
                     st.pane_exited(id);
