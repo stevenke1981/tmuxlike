@@ -256,12 +256,22 @@ fn conpty_copy_paste_resize_interrupt_detach_and_shell_exit() {
         "send-keys",
         "-t",
         "acceptance",
-        "Start-Sleep -Seconds 30",
+        "Write-Output ('sleep-' + 'started'); Start-Sleep -Seconds 30",
         "Enter",
     ]);
-    std::thread::sleep(Duration::from_millis(200));
+    app.wait("sleep pipeline started", |p| {
+        p.lines().any(|l| l.trim() == "sleep-started")
+    });
     let interrupt = Instant::now();
     peer.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    // PowerShell flushes queued input while unwinding a cancelled pipeline.
+    // Wait for prompt recovery before sending the next command on another IPC connection.
+    app.wait("Ctrl+C prompt recovery", |p| {
+        p.lines().last().is_some_and(|l| {
+            let line = l.trim();
+            line.starts_with("PS ") && line.ends_with('>')
+        })
+    });
     app.command(&[
         "send-keys",
         "-t",
