@@ -27,6 +27,7 @@ pub enum Cmd {
         page_up: bool,
     },
     PasteBuffer,
+    PasteClipboard,
     Detach,
     ChooseTree,
     ToggleSidebar,
@@ -91,10 +92,10 @@ pub fn tokenize(s: &str) -> Vec<String> {
     out
 }
 
-fn quote(s: &str) -> String {
+pub fn quote(s: &str) -> String {
     if s.is_empty()
         || s.chars()
-            .any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '#')
+            .any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '#' || c == '\\')
     {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
@@ -189,7 +190,7 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "previous-window" | "prev" => Cmd::PrevWindow,
         "select-window" | "selectw" => {
             let t = flag_val(args, "-t")
-                .or_else(|| rest())
+                .or_else(rest)
                 .ok_or("select-window: need -t N")?;
             Cmd::SelectWindow(
                 t.trim_start_matches(':')
@@ -199,6 +200,7 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         }
         "copy-mode" => Cmd::CopyMode { page_up: has("-u") },
         "paste-buffer" | "pasteb" => Cmd::PasteBuffer,
+        "paste-clipboard" => Cmd::PasteClipboard,
         "detach-client" | "detach" => Cmd::Detach,
         "choose-tree" | "choose-session" | "choose-window" => Cmd::ChooseTree,
         "toggle-sidebar" | "sidebar" => Cmd::ToggleSidebar,
@@ -268,49 +270,50 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
 
 /// Bytes for one `send-keys` argument: a key name (Enter, C-c, Up, ...) or literal text.
 pub fn send_key_bytes(arg: &str, literal: bool) -> Vec<u8> {
-    if !literal && arg.chars().count() > 1 {
-        if let Ok(n) = normalize_key(arg) {
-            let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
-            loop {
-                if let Some(r) = rest.strip_prefix("C-") {
-                    mods |= KeyModifiers::CONTROL;
-                    rest = r;
-                } else if let Some(r) = rest.strip_prefix("M-") {
-                    mods |= KeyModifiers::ALT;
-                    rest = r;
-                } else if let Some(r) = rest.strip_prefix("S-") {
-                    mods |= KeyModifiers::SHIFT;
-                    rest = r;
-                } else {
-                    break;
-                }
+    if !literal
+        && arg.chars().count() > 1
+        && let Ok(n) = normalize_key(arg)
+    {
+        let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
+        loop {
+            if let Some(r) = rest.strip_prefix("C-") {
+                mods |= KeyModifiers::CONTROL;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("M-") {
+                mods |= KeyModifiers::ALT;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("S-") {
+                mods |= KeyModifiers::SHIFT;
+                rest = r;
+            } else {
+                break;
             }
-            let code = match rest {
-                "Space" => Some(KeyCode::Char(' ')),
-                "Enter" => Some(KeyCode::Enter),
-                "Tab" => Some(KeyCode::Tab),
-                "BTab" => Some(KeyCode::BackTab),
-                "Escape" => Some(KeyCode::Esc),
-                "BSpace" => Some(KeyCode::Backspace),
-                "Up" => Some(KeyCode::Up),
-                "Down" => Some(KeyCode::Down),
-                "Left" => Some(KeyCode::Left),
-                "Right" => Some(KeyCode::Right),
-                "Home" => Some(KeyCode::Home),
-                "End" => Some(KeyCode::End),
-                "PageUp" => Some(KeyCode::PageUp),
-                "PageDown" => Some(KeyCode::PageDown),
-                "Insert" => Some(KeyCode::Insert),
-                "Delete" => Some(KeyCode::Delete),
-                f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
-                    Some(KeyCode::F(f[1..].parse().unwrap()))
-                }
-                c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
-                _ => None,
-            };
-            if let Some(code) = code {
-                return crate::keys::encode(&KeyEvent::new(code, mods), false);
+        }
+        let code = match rest {
+            "Space" => Some(KeyCode::Char(' ')),
+            "Enter" => Some(KeyCode::Enter),
+            "Tab" => Some(KeyCode::Tab),
+            "BTab" => Some(KeyCode::BackTab),
+            "Escape" => Some(KeyCode::Esc),
+            "BSpace" => Some(KeyCode::Backspace),
+            "Up" => Some(KeyCode::Up),
+            "Down" => Some(KeyCode::Down),
+            "Left" => Some(KeyCode::Left),
+            "Right" => Some(KeyCode::Right),
+            "Home" => Some(KeyCode::Home),
+            "End" => Some(KeyCode::End),
+            "PageUp" => Some(KeyCode::PageUp),
+            "PageDown" => Some(KeyCode::PageDown),
+            "Insert" => Some(KeyCode::Insert),
+            "Delete" => Some(KeyCode::Delete),
+            f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
+                Some(KeyCode::F(f[1..].parse().unwrap()))
             }
+            c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return crate::keys::encode(&KeyEvent::new(code, mods), false);
         }
     }
     arg.as_bytes().to_vec()
@@ -485,6 +488,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("[", "copy-mode"),
     ("PageUp", "copy-mode -u"),
     ("]", "paste-buffer"),
+    ("P", "paste-clipboard"),
     ("a", "toggle-sidebar"),
     ("b", "toggle-sidebar"),
     ("s", "choose-tree"),
@@ -502,6 +506,12 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn system_paste_has_a_distinct_prefix_binding() {
+        assert_eq!(parse("paste-clipboard").unwrap(), Cmd::PasteClipboard);
+        assert!(DEFAULT_BINDINGS.contains(&("P", "paste-clipboard")));
+        assert!(DEFAULT_BINDINGS.contains(&("]", "paste-buffer")));
+    }
 
     #[test]
     fn tokenize_quotes() {
@@ -514,6 +524,20 @@ mod tests {
             vec!["display", "a b", "c d"]
         );
         assert_eq!(tokenize(r#"set x """#), vec!["set", "x", ""]);
+    }
+
+    #[test]
+    fn cli_arguments_preserve_windows_paths_quotes_and_empty_text() {
+        for arg in [
+            r"C:\tools\config.toml",
+            r"\\host\share\file",
+            "a\tb",
+            "",
+            "echo \"a b\"",
+            "name#part",
+        ] {
+            assert_eq!(tokenize(&quote(arg)), vec![arg]);
+        }
     }
 
     #[test]

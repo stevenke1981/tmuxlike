@@ -12,12 +12,14 @@ macro_rules! log {
 }
 
 mod client;
+mod clipboard;
 mod commands;
 mod config;
 mod copy;
 mod ipc;
 mod keys;
 mod layout;
+mod paste;
 mod proto;
 mod render;
 mod server;
@@ -49,7 +51,8 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
   o          next pane            z          zoom pane
   x          kill pane            &          kill window
   [ / PgUp   copy mode (hjkl, v/V select, y copy, q exit)
-  ]          paste buffer         :          command prompt
+  ]          paste buffer         P          Windows system clipboard paste
+  :          command prompt       multi-line paste: y confirm / Esc cancel
   ,          rename window        $          rename session
   s / w      session chooser      ( )        prev/next session
   a  or b    toggle sidebar       r          reload config
@@ -96,13 +99,7 @@ fn main() {
             // any other tmux-style command is sent to the running server (e.g. source-file, set, bind-key)
             let line = args
                 .iter()
-                .map(|a| {
-                    if a.contains(' ') {
-                        format!("\"{a}\"")
-                    } else {
-                        a.clone()
-                    }
-                })
+                .map(|a| commands::quote(a))
                 .collect::<Vec<_>>()
                 .join(" ");
             match commands::parse(&line) {

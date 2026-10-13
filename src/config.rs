@@ -20,7 +20,7 @@ pub struct Config {
     pub busy_secs: f32,
     /// Name windows after the foreground process (unless renamed manually)
     pub automatic_rename: bool,
-    /// Copy selections to the system clipboard via OSC 52
+    /// Copy selections to the system clipboard (native on Windows, OSC 52 elsewhere)
     pub osc52: bool,
     /// Extra key bindings (after the prefix): key -> command
     pub bind: BTreeMap<String, String>,
@@ -91,6 +91,44 @@ impl Config {
         }
     }
 
+    pub fn shell_words(&self) -> Result<Vec<String>, String> {
+        let shell = self.default_shell();
+        if shell.trim().is_empty() || shell.contains('\0') {
+            return Err("shell must name an executable".into());
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+            let command: Vec<u16> = shell.trim().encode_utf16().chain(Some(0)).collect();
+            let mut count = 0;
+            let argv = unsafe { CommandLineToArgvW(command.as_ptr(), &mut count) };
+            if argv.is_null() {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let words = unsafe { std::slice::from_raw_parts(argv, count as usize) }
+                .iter()
+                .map(|p| {
+                    let mut len = 0;
+                    unsafe {
+                        while *p.add(len) != 0 {
+                            len += 1;
+                        }
+                        String::from_utf16_lossy(std::slice::from_raw_parts(*p, len))
+                    }
+                })
+                .collect();
+            unsafe {
+                LocalFree(argv.cast());
+            }
+            Ok(words)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(crate::commands::tokenize(&shell))
+        }
+    }
+
     pub fn prefix_name(&self) -> String {
         normalize_key(&self.prefix).unwrap_or_else(|_| "C-b".into())
     }
@@ -152,6 +190,27 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_paths_keep_backslashes_and_spaces() {
+        let c = Config {
+            shell: Some(r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile"#.into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            c.shell_words().unwrap(),
+            [
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "-NoLogo",
+                "-NoProfile"
+            ]
+        );
+        let c = Config {
+            shell: Some(r#""\\host\share\shell.exe" "a b""#.into()),
+            ..Config::default()
+        };
+        assert_eq!(c.shell_words().unwrap(), [r"\\host\share\shell.exe", "a b"]);
+    }
     #[test]
     fn parse_config() {
         let c: Config = toml::from_str(

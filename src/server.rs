@@ -5,6 +5,7 @@ use crate::copy::{self, CopyState};
 use crate::ipc;
 use crate::keys;
 use crate::layout::{Dir, Move, Node, Rect, neighbor};
+use crate::paste;
 use crate::proto::{ClientMsg, Command, ServerMsg, read_msg, write_msg};
 use crate::render::{Frame, chooser_entries, render_client};
 use anyhow::{Result, anyhow};
@@ -119,6 +120,9 @@ pub struct Client {
     pub message: Option<(String, Instant)>,
     /// mouse drag start: (pane, abs row, col), and whether we moved
     pub drag: Option<(usize, i64, u16, bool)>,
+    pub pending_paste: Option<(usize, String)>,
+    pub clipboard_serial: u64,
+    pub clipboard_request: Option<(u64, usize)>,
 }
 
 pub struct State {
@@ -206,7 +210,7 @@ impl State {
         };
         let pair = pty.openpty(size).map_err(|e| anyhow!("{e}"))?;
         let shell = self.cfg.default_shell();
-        let words = commands::tokenize(&shell);
+        let words = self.cfg.shell_words().map_err(|e| anyhow!(e))?;
         let mut cmd = CommandBuilder::new(words.first().map(|s| s.as_str()).unwrap_or("sh"));
         for a in words.iter().skip(1) {
             cmd.arg(a);
@@ -397,20 +401,22 @@ impl State {
             all.extend(self.visible_rects(s, w));
         }
         for (id, r) in all {
-            if let Some(p) = self.panes.get_mut(&id) {
-                if p.rect != r && r.w > 0 && r.h > 0 {
-                    p.rect = r;
-                    p.parser.screen_mut().set_size(r.h, r.w);
-                    let _ = p.master.resize(PtySize {
-                        rows: r.h,
-                        cols: r.w,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
-                    if let Some(c) = &mut p.copy {
-                        c.cx = c.cx.min(r.w - 1);
-                        c.cy = c.cy.min(r.h - 1);
-                    }
+            if let Some(p) = self.panes.get_mut(&id)
+                && p.rect != r
+                && r.w > 0
+                && r.h > 0
+            {
+                p.rect = r;
+                p.parser.screen_mut().set_size(r.h, r.w);
+                let _ = p.master.resize(PtySize {
+                    rows: r.h,
+                    cols: r.w,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+                if let Some(c) = &mut p.copy {
+                    c.cx = c.cx.min(r.w - 1);
+                    c.cy = c.cy.min(r.h - 1);
                 }
             }
         }
@@ -529,25 +535,73 @@ impl State {
             .get(&pid)
             .map(|p| p.parser.screen().bracketed_paste())
             .unwrap_or(false);
-        let text = text.replace("\r\n", "\r").replace('\n', "\r");
-        let data = if bp {
-            format!("\x1b[200~{text}\x1b[201~")
+        self.write_pane(pid, &paste::encode(text, bp));
+    }
+
+    fn request_paste(&mut self, cid: usize, pid: usize, text: &str) {
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.prefix = false;
+        }
+        let text = paste::normalize(text);
+        if text.is_empty() {
+            return;
+        }
+        if paste::needs_confirmation(&text) {
+            if let Some(c) = self.clients.get_mut(&cid) {
+                c.prefix = false;
+                c.pending_paste = Some((pid, text));
+            }
+            self.mark_dirty();
         } else {
-            text
-        };
-        self.write_pane(pid, data.as_bytes());
+            self.paste(pid, &text);
+        }
     }
 
     fn set_clipboard(&mut self, cid: usize, text: String) {
+        if text.is_empty() {
+            self.message(cid, "empty selection; clipboard unchanged");
+            return;
+        }
         let n = text.chars().count();
-        if self.cfg.osc52 {
-            let seq = copy::osc52(&text);
-            for c in self.clients.values_mut() {
-                let _ = write_msg(&mut c.sender, &ServerMsg::Output(seq.clone()));
-            }
+        if self.cfg.osc52
+            && let Some(c) = self.clients.get_mut(&cid)
+        {
+            let _ = write_msg(&mut c.sender, &ServerMsg::SetClipboard(text.clone()));
         }
         self.buffer = Some(text);
         self.message(cid, format!("copied {n} characters"));
+    }
+
+    fn clipboard_paste(&mut self, cid: usize, request_id: u64, result: Result<String, String>) {
+        let Some(c) = self.clients.get_mut(&cid) else {
+            return;
+        };
+        let Some((expected, pid)) = c.clipboard_request else {
+            return;
+        };
+        if request_id != expected {
+            return;
+        }
+        c.clipboard_request = None;
+        if c.prompt.is_some()
+            || c.chooser.is_some()
+            || c.popup.is_some()
+            || c.pending_paste.is_some()
+        {
+            self.message(cid, "system paste cancelled: input context changed");
+            return;
+        }
+        let Some(si) = self.client_si(cid) else {
+            return;
+        };
+        if self.active_pane(si) != pid || !self.panes.contains_key(&pid) {
+            self.message(cid, "system paste cancelled: target pane changed");
+            return;
+        }
+        match result {
+            Ok(text) => self.request_paste(cid, pid, &text),
+            Err(e) => self.message(cid, e),
+        }
     }
 
     fn switch_session(&mut self, cid: usize, ni: usize) {
@@ -830,9 +884,18 @@ impl State {
             Cmd::PasteBuffer => {
                 if let Some(b) = self.buffer.clone() {
                     let pid = self.active_pane(si);
-                    self.paste(pid, &b);
+                    self.request_paste(cid, pid, &b);
                 } else {
                     return Err("no buffer".into());
+                }
+            }
+            Cmd::PasteClipboard => {
+                let pid = self.active_pane(si);
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.clipboard_serial = c.clipboard_serial.wrapping_add(1);
+                    c.clipboard_request = Some((c.clipboard_serial, pid));
+                    write_msg(&mut c.sender, &ServerMsg::ReadClipboard(c.clipboard_serial))
+                        .map_err(|e| e.to_string())?;
                 }
             }
             Cmd::Detach => {
@@ -937,13 +1000,18 @@ impl State {
             }
             Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(shared, cid, si, k),
             Event::Paste(text) => {
+                if self.clients.get(&cid).is_some_and(|c| {
+                    c.pending_paste.is_some() || c.chooser.is_some() || c.popup.is_some()
+                }) {
+                    return;
+                }
                 if let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    p.buf.push_str(&text.replace(['\r', '\n'], " "));
+                    p.buf.push_str(&paste::normalize(&text).replace('\n', " "));
                     self.mark_dirty();
                     return;
                 }
                 let pid = self.active_pane(si);
-                self.paste(pid, &text);
+                self.request_paste(cid, pid, &text);
             }
             Event::Mouse(m) if self.cfg.mouse => self.handle_mouse(cid, si, m),
             _ => {}
@@ -983,11 +1051,11 @@ impl State {
                         }
                     }
                     self.mark_dirty();
-                } else if m.row == s.rows - 1 {
-                    if let Some(wi) = crate::render::status_hit(s, m.column) {
-                        self.sessions[si].active = wi;
-                        self.relayout(si);
-                    }
+                } else if m.row == s.rows - 1
+                    && let Some(wi) = crate::render::status_hit(s, m.column)
+                {
+                    self.sessions[si].active = wi;
+                    self.relayout(si);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1080,6 +1148,25 @@ impl State {
         let Some(c) = self.clients.get_mut(&cid) else {
             return;
         };
+        if c.pending_paste.is_some() {
+            match k.code {
+                KeyCode::Char('y') if k.modifiers.is_empty() && k.kind == KeyEventKind::Press => {
+                    let (pid, text) = c.pending_paste.take().unwrap();
+                    if self.active_pane(si) == pid && self.panes.contains_key(&pid) {
+                        self.paste(pid, &text);
+                    } else {
+                        self.message(cid, "paste cancelled: target pane changed");
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => c.pending_paste = None,
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    c.pending_paste = None
+                }
+                _ => {}
+            }
+            self.mark_dirty();
+            return;
+        }
         // overlays first
         if let Some((lines, off)) = &mut c.popup {
             let max = lines.len().saturating_sub(1);
@@ -1168,9 +1255,8 @@ impl State {
                 return;
             }
             let Some(name) = key_name(&k) else { return };
-            match self.bindings.get(&name).cloned() {
-                Some(line) => self.run_line(shared, cid, &line),
-                None => {}
+            if let Some(line) = self.bindings.get(&name).cloned() {
+                self.run_line(shared, cid, &line)
             }
             return;
         }
@@ -1386,6 +1472,9 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                         popup: None,
                         message: None,
                         drag: None,
+                        pending_paste: None,
+                        clipboard_serial: 0,
+                        clipboard_request: None,
                     };
                     Ok(render_client(&st, &mut c).unwrap_or_default())
                 }
@@ -1448,17 +1537,29 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                     popup: None,
                     message: None,
                     drag: None,
+                    pending_paste: None,
+                    clipboard_serial: 0,
+                    clipboard_request: None,
                 },
             );
             st.mark_dirty();
             drop(st);
             while let Ok(msg) = read_msg::<ClientMsg>(&mut r) {
-                if let ClientMsg::Event(ev) = msg {
-                    let mut st = shared.lock().unwrap();
-                    if !st.clients.contains_key(&cid) {
-                        break;
+                let mut st = shared.lock().unwrap();
+                if !st.clients.contains_key(&cid) {
+                    break;
+                }
+                match msg {
+                    ClientMsg::Event(ev) => st.handle_event(&shared, cid, ev),
+                    ClientMsg::ClipboardError(e) => st.message(cid, e),
+                    ClientMsg::ClipboardPaste { request_id, text } => {
+                        st.clipboard_paste(cid, request_id, Ok(text))
                     }
-                    st.handle_event(&shared, cid, ev);
+                    ClientMsg::ClipboardPasteError {
+                        request_id,
+                        message,
+                    } => st.clipboard_paste(cid, request_id, Err(message)),
+                    ClientMsg::Hello(_) => {}
                 }
             }
             shared.lock().unwrap().clients.remove(&cid);
@@ -1528,11 +1629,11 @@ pub fn run() -> Result<()> {
                             }
                             if let Some(n) =
                                 st.panes.get(&w.active).and_then(|p| p.foreground_name())
+                                && !n.is_empty()
+                                && n != w.name
                             {
-                                if !n.is_empty() && n != w.name {
-                                    w.name = n;
-                                    st.dirty = true;
-                                }
+                                w.name = n;
+                                st.dirty = true;
                             }
                         }
                     }
@@ -1570,11 +1671,11 @@ pub fn run() -> Result<()> {
             let mut clients = std::mem::take(&mut st.clients);
             let mut gone = vec![];
             for (id, c) in clients.iter_mut() {
-                if let Some(out) = render_client(&st, c) {
-                    if !out.is_empty() && write_msg(&mut c.sender, &ServerMsg::Output(out)).is_err()
-                    {
-                        gone.push(*id);
-                    }
+                if let Some(out) = render_client(&st, c)
+                    && !out.is_empty()
+                    && write_msg(&mut c.sender, &ServerMsg::Output(out)).is_err()
+                {
+                    gone.push(*id);
                 }
             }
             for id in gone {
@@ -1584,12 +1685,163 @@ pub fn run() -> Result<()> {
         }
     });
 
-    let mut cid = 0;
-    for conn in listener.incoming().flatten() {
-        cid += 1;
+    for (index, conn) in listener.incoming().flatten().enumerate() {
         let sh = shared.clone();
-        let id = cid;
+        let id = index + 1;
         std::thread::spawn(move || handle_conn(sh, id, conn));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn state() -> (Shared, Sink, Sink) {
+        let (notify, _) = mpsc::channel();
+        let cfg = Config::default();
+        let (bindings, _) = cfg.bindings();
+        let mut st = State {
+            cfg,
+            bindings,
+            buffer: None,
+            panes: HashMap::new(),
+            sessions: vec![],
+            clients: HashMap::new(),
+            next_id: 2,
+            dirty: false,
+            notify,
+        };
+        let a = Sink::default();
+        let b = Sink::default();
+        for (cid, sender) in [(1, a.clone()), (2, b.clone())] {
+            st.clients.insert(
+                cid,
+                Client {
+                    session: "test".into(),
+                    sender: Box::new(sender),
+                    prefix: false,
+                    frame: Frame::default(),
+                    prompt: None,
+                    chooser: None,
+                    popup: None,
+                    message: None,
+                    drag: None,
+                    pending_paste: None,
+                    clipboard_serial: 0,
+                    clipboard_request: None,
+                },
+            );
+        }
+        (Arc::new(Mutex::new(st)), a, b)
+    }
+
+    #[test]
+    fn copy_only_requests_the_initiating_clients_clipboard() {
+        let (shared, a, b) = state();
+        let mut st = shared.lock().unwrap();
+        st.set_clipboard(1, "自造 😀".into());
+        let bytes = a.0.lock().unwrap();
+        let msg: ServerMsg = read_msg(&mut &bytes[..]).unwrap();
+        assert!(matches!(msg, ServerMsg::SetClipboard(s) if s == "自造 😀"));
+        assert!(b.0.lock().unwrap().is_empty());
+        assert_eq!(st.buffer.as_deref(), Some("自造 😀"));
+    }
+
+    #[test]
+    fn disabled_system_copy_keeps_internal_buffer_and_empty_copy_does_not_clear_it() {
+        let (shared, a, b) = state();
+        let mut st = shared.lock().unwrap();
+        st.cfg.osc52 = false;
+        st.set_clipboard(1, "sample".into());
+        st.set_clipboard(1, String::new());
+        assert_eq!(st.buffer.as_deref(), Some("sample"));
+        assert!(a.0.lock().unwrap().is_empty());
+        assert!(b.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn newline_paste_is_held_and_escape_discards_it() {
+        let (shared, _, _) = state();
+        let mut st = shared.lock().unwrap();
+        st.request_paste(1, 42, "echo a\r\necho b\r\n");
+        assert_eq!(
+            st.clients[&1].pending_paste,
+            Some((42, "echo a\necho b\n".into()))
+        );
+        st.handle_key(
+            &shared,
+            1,
+            0,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(st.clients[&1].pending_paste.is_some());
+        st.handle_key(
+            &shared,
+            1,
+            0,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(st.clients[&1].pending_paste.is_none());
+    }
+
+    #[test]
+    fn unsolicited_and_stale_clipboard_responses_are_ignored() {
+        let (shared, _, _) = state();
+        let mut st = shared.lock().unwrap();
+        st.clipboard_paste(1, 1, Ok("do not insert\n".into()));
+        assert!(st.clients[&1].pending_paste.is_none());
+        st.clients.get_mut(&1).unwrap().clipboard_request = Some((2, 42));
+        st.clipboard_paste(1, 1, Ok("stale\n".into()));
+        assert_eq!(st.clients[&1].clipboard_request, Some((2, 42)));
+        assert!(st.clients[&1].pending_paste.is_none());
+        st.clipboard_paste(2, 2, Ok("other client\n".into()));
+        assert_eq!(st.clients[&1].clipboard_request, Some((2, 42)));
+    }
+
+    #[test]
+    fn clipboard_response_cannot_insert_into_a_new_prompt() {
+        let (shared, _, _) = state();
+        let mut st = shared.lock().unwrap();
+        let c = st.clients.get_mut(&1).unwrap();
+        c.clipboard_request = Some((3, 42));
+        c.prompt = Some(Prompt {
+            kind: PromptKind::Command,
+            buf: "safe".into(),
+        });
+        st.clipboard_paste(1, 3, Ok("kill-server\n".into()));
+        assert_eq!(st.clients[&1].prompt.as_ref().unwrap().buf, "safe");
+        assert!(st.clients[&1].clipboard_request.is_none());
+        assert!(st.clients[&1].pending_paste.is_none());
+    }
+
+    #[test]
+    fn repeated_keys_do_not_confirm_multiline_paste() {
+        let (shared, _, _) = state();
+        let mut st = shared.lock().unwrap();
+        st.request_paste(1, 42, "echo held\n");
+        let mut repeated = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        repeated.kind = KeyEventKind::Repeat;
+        st.handle_key(&shared, 1, 0, repeated);
+        assert!(st.clients[&1].pending_paste.is_some());
+        st.handle_key(
+            &shared,
+            1,
+            0,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(st.clients[&1].pending_paste.is_none());
+    }
 }

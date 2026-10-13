@@ -29,6 +29,9 @@ pub enum Command {
 pub enum ClientMsg {
     Hello(Command),
     Event(crossterm::event::Event),
+    ClipboardError(String),
+    ClipboardPaste { request_id: u64, text: String },
+    ClipboardPasteError { request_id: u64, message: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -37,6 +40,8 @@ pub enum ServerMsg {
     Text(String),
     Exit(String),
     Error(String),
+    SetClipboard(String),
+    ReadClipboard(u64),
 }
 
 pub fn write_msg<T: Serialize>(w: &mut dyn Write, msg: &T) -> io::Result<()> {

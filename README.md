@@ -1,5 +1,9 @@
 # tmuxlike
 
+Windows clipboard and terminal validation: [usage and limits](docs/WINDOWS.md).
+Windows copy uses the native Unicode clipboard; `Ctrl-b P` pastes the system clipboard.
+Multi-line paste requires `y` confirmation; `Esc` cancels. Ordinary `Ctrl+C` interrupts the pane.
+
 跨平台終端多工器（terminal multiplexer），以 Rust 撰寫，功能類似 tmux / herdr。主要支援 **Windows** 與 **Linux**，相容 **macOS**。
 
 A cross-platform terminal multiplexer written in Rust, inspired by tmux and herdr. Primary targets: **Windows** and **Linux**; also works on **macOS**.
@@ -15,8 +19,8 @@ A cross-platform terminal multiplexer written in Rust, inspired by tmux and herd
 - 滑鼠：點選聚焦窗格、點狀態列切換視窗、滾輪捲動 · Mouse: click to focus, click status bar to switch windows, wheel to scroll
 - herdr 風格側邊欄：顯示所有 session / pane 的狀態（● 執行中 working、◆ 完成待查看 done、○ 閒置 idle），適合同時監看多個 AI agent
   herdr-like sidebar showing every pane's status (● working, ◆ done/needs attention, ○ idle) — handy for watching several AI coding agents
-- 複製模式：vi 風格游標移動與選取（`v` 字元 / `V` 整行），`y` 複製；滑鼠拖曳選取自動複製；`prefix ]` 貼上；同時透過 OSC 52 寫入系統剪貼簿
-  Copy mode with vi-style movement and selection (`v` / `V`, `y` to yank), mouse-drag selection, `prefix ]` to paste, system clipboard via OSC 52
+- 複製模式：vi 風格游標移動與選取（`v` 字元 / `V` 整行），`y` 複製；滑鼠拖曳選取自動複製；`prefix ]` 貼上；同時透過 Windows 原生 API／其他平台 OSC 52 寫入系統剪貼簿
+  Copy mode with vi-style movement and selection (`v` / `V`, `y` to yank), mouse-drag selection, `prefix ]` to paste, system clipboard (native on Windows, OSC 52 elsewhere)
 - `:` 指令列，支援 tmux 風格指令 · `:` command prompt with tmux-style commands
 - 自訂按鍵（config.toml 的 `[bind]` / `unbind`，或執行期 `bind-key` / `unbind-key`）· Custom key bindings
 - Session／視窗選單（`prefix s`）· Interactive session/window tree chooser
@@ -100,8 +104,8 @@ tmuxlike set mouse off          # 任何伺服器指令皆可從命令列執行 
 | `Esc` | 取消選取（再按離開）Clear selection (again to exit) |
 | `q` | 離開 Exit |
 
-滑鼠：在窗格內拖曳即選取，放開時自動複製（含 OSC 52 系統剪貼簿）。
-Mouse: drag inside a pane to select; releasing copies (also to the system clipboard via OSC 52).
+滑鼠：在窗格內拖曳即選取，放開時自動複製（含系統剪貼簿：Windows 原生／其他平台 OSC 52）。
+Mouse: drag inside a pane to select; releasing copies (also to the system clipboard (native on Windows, OSC 52 elsewhere)).
 
 ## 指令 Commands
 
@@ -136,7 +140,7 @@ sidebar = false         # 啟動時顯示側邊欄 show sidebar on start
 sidebar_width = 28
 busy_secs = 1.5         # 最後輸出後幾秒內視為 working / seconds after output counted as "working"
 automatic_rename = true # 依前景程式自動命名視窗 / auto-name windows
-osc52 = true            # 複製時寫入系統剪貼簿 / copy to system clipboard via OSC 52
+osc52 = true            # 複製時寫入系統剪貼簿 / copy to system clipboard (native on Windows, OSC 52 elsewhere)
 
 unbind = ["x"]          # 移除預設按鍵；"all" 移除全部 / remove defaults ("all" = every default)
 commands = ["set busy-secs 2"]   # 載入後執行的指令 / commands run after loading
@@ -157,8 +161,8 @@ A `.toml` file replaces the whole config; any other file is run line by line as 
 ## 限制 Limitations
 
 - 視窗自動命名僅支援 Linux / macOS；Windows 使用 shell 名稱 / Automatic window naming works on Linux/macOS only; Windows uses the shell name
-- OSC 52 需要外層終端支援（Windows Terminal、iTerm2、kitty、WezTerm 等）；不支援時仍可用內部緩衝區 `prefix ]`
-  OSC 52 requires a supporting outer terminal; the internal buffer (`prefix ]`) always works
+- Linux/macOS 的 OSC 52 需要外層終端支援（Windows Terminal、iTerm2、kitty、WezTerm 等）；不支援時仍可用內部緩衝區 `prefix ]`
+  On Linux/macOS, OSC 52 requires a supporting outer terminal; Windows uses the native clipboard. The internal buffer (`prefix ]`) always works
 - 只有一個按鍵表（prefix 表），尚無 `-n` 免前綴綁定、複製模式內搜尋、多個貼上緩衝區
   Single key table (prefix only): no `-n` root bindings, no search in copy mode, single paste buffer
 - 窗格內程式的滑鼠事件不會轉送（滾輪在全螢幕程式中轉為方向鍵）/ Mouse events are not forwarded to apps (wheel becomes arrow keys in full-screen apps)

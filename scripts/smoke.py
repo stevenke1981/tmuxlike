@@ -5,15 +5,22 @@ Starts a detached session, checks the shell prompt shows up in the pane
 that the server renders real ANSI frames.
 Usage: python scripts/smoke.py [path-to-tmuxlike]
 """
-import os, subprocess, sys, time, re
+import os, subprocess, sys, time, re, json
 
 exe = sys.argv[1] if len(sys.argv) > 1 else os.path.join("target", "release", "tmuxlike" + (".exe" if os.name == "nt" else ""))
 import tempfile
-LOG = os.path.join(tempfile.gettempdir(), "tmuxlike-smoke.log")
-if os.path.exists(LOG):
-    os.remove(LOG)
-env = dict(os.environ, TMUXLIKE_SOCKET="tmuxlike-smoke-%d.sock" % os.getpid(), TMUXLIKE_LOG=LOG)
+work = tempfile.mkdtemp(prefix="tmuxlike-smoke-")
+LOG = os.path.join(work, "server.log")
+config = os.path.join(work, "config.toml")
+with open(config, "w", encoding="utf-8") as f:
+    history = os.path.join(work, "shell-history.txt").replace("'", "''")
+    shell = 'powershell.exe -NoLogo -NoProfile -NoExit -Command "Set-PSReadLineOption -HistorySavePath \'%s\' -HistorySaveStyle SaveNothing"' % history if os.name == "nt" else "/bin/sh"
+    f.write("shell = " + json.dumps(shell) + "\n")
+    f.write("osc52 = false\n")
+env = dict(os.environ, TMUXLIKE_SOCKET="tmuxlike-smoke-%d.sock" % os.getpid(), TMUXLIKE_LOG=LOG, TMUXLIKE_CONFIG=config)
 env.pop("TMUXLIKE", None)
+env.pop("ENV", None)
+env.pop("BASH_ENV", None)
 win = os.name == "nt"
 
 
@@ -54,6 +61,7 @@ try:
     assert "tmuxlike-smoke-ok" in frame, "pane text missing from frame"
     print("frame: %d bytes of ANSI, OK" % len(frame))
     print("PASS")
+    print("Evidence directory:", work)
 finally:
     tl("kill-server", check=False)
     if os.path.exists(LOG):

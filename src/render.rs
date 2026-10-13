@@ -222,11 +222,16 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                 if cell.inverse() {
                     attrs |= INVERSE;
                 }
-                if let Some((a, b, line)) = sel {
-                    if crate::copy::in_selection(a, b, line, (crate::copy::abs_row(row, off), col))
-                    {
-                        attrs ^= INVERSE;
-                    }
+                if let Some((a, b, line)) = sel
+                    && crate::copy::cell_in_selection(
+                        a,
+                        b,
+                        line,
+                        (crate::copy::abs_row(row, off), col),
+                        cell.is_wide(),
+                    )
+                {
+                    attrs ^= INVERSE;
                 }
                 let txt = cell.contents();
                 g.put(
@@ -401,7 +406,6 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
 
     // status bar
     let sy = h - 1;
-    let mut cursor_pos = cursor_pos;
     for x in 0..w {
         g.put(
             x,
@@ -569,7 +573,18 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                 g.text(bx + 2, y, bw - 4, &t, fg, bg, if *bold { BOLD } else { 0 });
             }
         };
-    if let Some(sel) = c.chooser {
+    if let Some((_, text)) = &c.pending_paste {
+        let mut lines = vec![(
+            "Newlines may execute commands in the shell.".to_string(),
+            true,
+        )];
+        lines.extend(text.lines().take(6).map(|l| (l.to_string(), false)));
+        if text.lines().count() > 6 {
+            lines.push(("...".into(), false));
+        }
+        overlay(&mut g, "Paste: y confirm / Esc cancel", &lines, None, 0);
+        cursor_pos = None;
+    } else if let Some(sel) = c.chooser {
         let lines: Vec<(String, bool)> = chooser_entries(st)
             .into_iter()
             .map(|(si, wi)| {

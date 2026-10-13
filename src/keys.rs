@@ -99,7 +99,7 @@ pub fn encode(k: &KeyEvent, app_cursor: bool) -> Vec<u8> {
             alt_prefix = false;
             match n {
                 1..=4 => {
-                    let fin = [b'P', b'Q', b'R', b'S'][n as usize - 1] as char;
+                    let fin = b"PQRS"[n as usize - 1] as char;
                     if modnum > 1 {
                         out.extend_from_slice(format!("\x1b[1;{modnum}{fin}").as_bytes());
                     } else {
@@ -163,6 +163,23 @@ fn finish(mut out: Vec<u8>, alt: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_ctrl_c_and_ctrl_v_keep_terminal_semantics() {
+        assert_eq!(
+            encode(
+                &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                false
+            ),
+            b"\x03"
+        );
+        assert_eq!(
+            encode(
+                &KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                false
+            ),
+            b"\x16"
+        );
+    }
     fn k(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
     }

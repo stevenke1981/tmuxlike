@@ -7,6 +7,47 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+enum Action {
+    Exit(String),
+    Paste(u64, std::io::Result<String>),
+    #[cfg(windows)]
+    ClipboardError(String),
+}
+
+struct TerminalGuard;
+
+#[cfg(any(windows, test))]
+fn confirmation_key_event(mut key: event::KeyEvent, down: &mut bool) -> event::KeyEvent {
+    // Windows crossterm reports native auto-repeat as Press, not Repeat.
+    // Holding y before a paste dialog opens must not grant consent.
+    if matches!(key.code, event::KeyCode::Char('y' | 'Y')) {
+        match key.kind {
+            event::KeyEventKind::Release => *down = false,
+            event::KeyEventKind::Press => {
+                if *down {
+                    key.kind = event::KeyEventKind::Repeat;
+                }
+                *down = true;
+            }
+            _ => {}
+        }
+    }
+    key
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(
+            std::io::stdout(),
+            event::DisableBracketedPaste,
+            event::DisableMouseCapture,
+            crossterm::cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
 fn spawn_server() -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -32,8 +73,9 @@ fn spawn_server() -> Result<()> {
                 }
             }
         }
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
+        // DETACHED_PROCESS already disconnects the server from the client's console.
+        // CREATE_NEW_PROCESS_GROUP would disable Ctrl+C, inherited by ConPTY shells.
+        cmd.creation_flags(0x0000_0008 | 0x0800_0000);
     }
     #[cfg(unix)]
     {
@@ -145,6 +187,7 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
 
     let mut out = std::io::stdout();
     terminal::enable_raw_mode()?;
+    let guard = TerminalGuard;
     execute!(
         out,
         terminal::EnterAlternateScreen,
@@ -153,7 +196,7 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
         terminal::Clear(terminal::ClearType::All)
     )?;
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<Action>();
     let first_out = match first {
         ServerMsg::Output(s) => Some(s),
         _ => None,
@@ -171,42 +214,102 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
                     let _ = out.flush();
                 }
                 Ok(ServerMsg::Exit(reason)) => {
-                    let _ = tx.send(reason);
+                    let _ = tx.send(Action::Exit(reason));
                     return;
                 }
                 Ok(ServerMsg::Error(e)) => {
-                    let _ = tx.send(format!("error: {e}"));
+                    let _ = tx.send(Action::Exit(format!("error: {e}")));
                     return;
                 }
                 Ok(ServerMsg::Text(_)) => {}
+                Ok(ServerMsg::ReadClipboard(request_id)) => {
+                    let _ = tx.send(Action::Paste(request_id, crate::clipboard::read()));
+                }
+                Ok(ServerMsg::SetClipboard(text)) => {
+                    #[cfg(windows)]
+                    if let Err(e) = crate::clipboard::write(&text) {
+                        let _ = tx.send(Action::ClipboardError(format!(
+                            "system copy failed: {e}; internal buffer retained"
+                        )));
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = out.write_all(crate::copy::osc52(&text).as_bytes());
+                        let _ = out.flush();
+                    }
+                }
                 Err(_) => {
-                    let _ = tx.send("server exited".into());
+                    let _ = tx.send(Action::Exit("server exited".into()));
                     return;
                 }
             }
         }
     });
 
+    #[cfg(windows)]
+    let mut confirmation_down = false;
     let reason = loop {
-        if let Ok(r) = rx.try_recv() {
-            break r;
+        if let Ok(action) = rx.try_recv() {
+            let msg = match action {
+                Action::Exit(reason) => break reason,
+                Action::Paste(request_id, Ok(text)) => {
+                    ClientMsg::ClipboardPaste { request_id, text }
+                }
+                Action::Paste(request_id, Err(e)) => ClientMsg::ClipboardPasteError {
+                    request_id,
+                    message: format!("system paste failed: {e}"),
+                },
+                #[cfg(windows)]
+                Action::ClipboardError(e) => ClientMsg::ClipboardError(e),
+            };
+            if write_msg(&mut w, &msg).is_err() {
+                break "connection lost".into();
+            }
         }
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
+            #[cfg(windows)]
+            let ev = match ev {
+                event::Event::Key(key) => {
+                    event::Event::Key(confirmation_key_event(key, &mut confirmation_down))
+                }
+                other => other,
+            };
             if write_msg(&mut w, &ClientMsg::Event(ev)).is_err() {
                 break "connection lost".into();
             }
         }
     };
 
-    execute!(
-        out,
-        event::DisableBracketedPaste,
-        event::DisableMouseCapture,
-        crossterm::cursor::Show,
-        terminal::LeaveAlternateScreen
-    )?;
-    terminal::disable_raw_mode()?;
+    drop(guard);
     println!("[{reason}]");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_repeated_y_needs_release_before_confirming_again() {
+        use event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let mut down = false;
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(
+            confirmation_key_event(y, &mut down).kind,
+            KeyEventKind::Press
+        );
+        assert_eq!(
+            confirmation_key_event(y, &mut down).kind,
+            KeyEventKind::Repeat
+        );
+        let mut released = y;
+        released.kind = KeyEventKind::Release;
+        confirmation_key_event(released, &mut down);
+        assert_eq!(
+            confirmation_key_event(y, &mut down).kind,
+            KeyEventKind::Press
+        );
+        let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(confirmation_key_event(interrupt, &mut down), interrupt);
+    }
 }

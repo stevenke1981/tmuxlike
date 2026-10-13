@@ -24,6 +24,16 @@ pub fn in_selection(a: (i64, u16), b: (i64, u16), line: bool, p: (i64, u16)) -> 
     }
 }
 
+pub fn cell_in_selection(
+    a: (i64, u16),
+    b: (i64, u16),
+    line: bool,
+    p: (i64, u16),
+    wide: bool,
+) -> bool {
+    in_selection(a, b, line, p) || (wide && in_selection(a, b, line, (p.0, p.1.saturating_add(1))))
+}
+
 /// Extract text between two absolute positions (inclusive).
 pub fn extract(parser: &mut vt100::Parser, a: (i64, u16), b: (i64, u16), line: bool) -> String {
     let (s, e) = if a <= b { (a, b) } else { (b, a) };
@@ -40,9 +50,16 @@ pub fn extract(parser: &mut vt100::Parser, a: (i64, u16), b: (i64, u16), line: b
         if v >= rows {
             continue;
         }
-        let c0 = if r == s.0 && !line { s.1 } else { 0 };
+        let mut c0 = if r == s.0 && !line { s.1.min(cols) } else { 0 };
+        if parser
+            .screen()
+            .cell(v, c0)
+            .is_some_and(|c| c.is_wide_continuation())
+        {
+            c0 = c0.saturating_sub(1);
+        }
         let c1 = if r == e.0 && !line {
-            (e.1 + 1).min(cols)
+            e.1.saturating_add(1).min(cols)
         } else {
             cols
         };
@@ -70,6 +87,7 @@ pub fn extract(parser: &mut vt100::Parser, a: (i64, u16), b: (i64, u16), line: b
     out
 }
 
+#[cfg(any(not(windows), test))]
 pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -92,6 +110,7 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+#[cfg(any(not(windows), test))]
 pub fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
 }
@@ -99,6 +118,27 @@ pub fn osc52(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unicode_selection_includes_a_wide_glyph_touched_at_either_cell() {
+        let mut p = vt100::Parser::new(3, 24, 10);
+        p.process("中日本語 😀 e\u{301}".as_bytes());
+        assert_eq!(extract(&mut p, (0, 1), (0, 1), false), "中");
+        assert_eq!(extract(&mut p, (0, 0), (0, 0), false), "中");
+        assert_eq!(
+            extract(&mut p, (0, 0), (0, 13), false),
+            "中日本語 😀 e\u{301}"
+        );
+        assert_eq!(p.screen().scrollback(), 0);
+        assert!(cell_in_selection((0, 1), (0, 1), false, (0, 0), true));
+        assert!(!cell_in_selection((0, 1), (0, 1), false, (0, 0), false));
+    }
+
+    #[test]
+    fn wrapped_cjk_copy_has_no_spurious_newlines() {
+        let mut p = vt100::Parser::new(3, 6, 10);
+        p.process("中文日本語abc".as_bytes());
+        assert_eq!(extract(&mut p, (0, 0), (2, 0), false), "中文日本語abc");
+    }
     #[test]
     fn b64() {
         assert_eq!(base64(b""), "");
