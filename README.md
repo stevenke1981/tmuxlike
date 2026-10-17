@@ -28,8 +28,8 @@ A cross-platform terminal multiplexer written in Rust, inspired by tmux and herd
   Backends: ConPTY + named pipes on Windows; PTY + unix sockets on Linux/macOS
 - JSON 自動化 API：`tmuxlike pane|agent|session|api ...` 以 JSON 列出／分割／輸入／讀取窗格，回報與等待 agent 狀態（見下節）
   JSON automation API: `tmuxlike pane|agent|session|api ...` lists, splits, types into and reads panes, and reports and waits on agent state (see below)
-- 版面保存：伺服器重啟後還原 session、視窗、分割與窗格工作目錄（`persist`）
-  Layout persistence: sessions, windows, splits and pane directories are restored after a server restart (`persist`)
+- 版面保存：伺服器重啟後還原 session、視窗、分割與窗格目錄（Linux 為即時目錄，其他平台為啟動目錄）（`persist`）
+  Layout persistence: sessions, windows, splits and pane directories are restored after a server restart (live directories on Linux, start directories elsewhere) (`persist`)
 
 ## 安裝 Install
 
@@ -135,11 +135,17 @@ A JSON command interface over the same local socket, so scripts and coding agent
   Success: `{"result": ...}` on stdout with exit 0; `pane read` and `agent read` print raw text.
 - 失敗：stderr 印出 `{"error": {"code": "...", "message": "..."}}`，exit 1。命令語法錯誤（例如未知選項）exit 2。
   Failure: `{"error": {"code", "message"}}` on stderr with exit 1. Syntax errors (for example an unknown option) exit 2.
-- 常見錯誤代碼 Common codes: `pane_not_found`, `agent_not_found`, `session_not_found`, `invalid_argument`, `timeout`, `agent_blocked`, `name_taken`, `no_neighbor`, `spawn_failed`, `internal`.
+- 常見錯誤代碼 Common codes: `pane_not_found`, `agent_not_found`, `session_not_found`, `server_not_running`, `invalid_argument`, `timeout`, `agent_blocked`, `name_taken`, `no_neighbor`, `spawn_failed`, `internal`.
 - 窗格 ID 為 `p<N>`，同一次伺服器執行期間不變；伺服器重啟後請重新以 `pane list` 查詢。也接受 tmux 風格的 `%N`。
   Pane IDs are `p<N>` (also accepts tmux-style `%N`). They are stable while one server runs; query `pane list` again after a restart.
 - 每個窗格的環境變數 `TMUXLIKE_PANE_ID` 即是該窗格的 ID；`--current` 指向呼叫者所在窗格。省略 ID 時，目標為最近使用之 session 的焦點窗格。
   Each pane has `TMUXLIKE_PANE_ID` set to its own ID; `--current` targets the calling pane. An omitted ID means the focused pane of the most recently used session.
+- 伺服器未執行時，API 指令在 stderr 印出 `{"error":{"code":"server_not_running","message":"..."}}` 並 exit 1。
+  With no server running, API commands print `{"error":{"code":"server_not_running","message":"..."}}` on stderr and exit 1.
+- `tmuxlike <group> --help`（例如 `tmuxlike pane --help`）把說明印到 stdout 並以 exit 0 結束，不需要伺服器；`tmuxlike pane` 不帶子指令時亦同。
+  `tmuxlike <group> --help` (for example `tmuxlike pane --help`) prints the help to stdout and exits 0 without a server; `tmuxlike pane` with no subcommand behaves the same.
+- `pane wait-output` 以邏輯行比對：自動換行（soft wrap）的列會先接合再比對，因此超過窗格寬度的字串仍可符合。`--match` 為字面子字串，`--regex` 為正規表示式。
+  `pane wait-output` matches logical lines: soft-wrapped rows are joined before matching, so a string wider than the pane still matches. `--match` is a literal substring; `--regex` is a regular expression.
 
 ### 指令 Commands
 
@@ -162,7 +168,7 @@ A JSON command interface over the same local socket, so scripts and coding agent
 | pane | `pane release-agent <id> --source S --agent L` | 釋放回報的 agent 狀態 Release reported state |
 | agent | `agent list` | 列出 agent List agents |
 | agent | `agent get\|read\|send-keys\|focus <target>` | 查詢、讀取、送鍵、聚焦 Inspect, read, send keys, focus |
-| agent | `agent rename <target> <name>` / `--clear` | 設定唯一名稱 Set a unique name |
+| agent | `agent rename <target> <name>` / `--clear` | 設定唯一名稱；窗格須已有回報，名稱符合 `[a-z][a-z0-9_-]{0,31}` 且不可像窗格 ID（如 `p12`）Set a unique name; the pane must already have a report, and the name must match `[a-z][a-z0-9_-]{0,31}` and not look like a pane ID (such as `p12`) |
 | agent | `agent wait <target> [--until S]... [--timeout MS]` | 等待狀態 Wait for a state |
 | agent | `agent prompt <target> <text> [--wait] [--until S] [--timeout MS]` | 送出提示；被 blocked 時回傳 `agent_blocked` Submit a prompt |
 | session / server | `session list` | 列出 session List sessions |
@@ -218,12 +224,20 @@ tmuxlike agent read reviewer --source recent --lines 80
 
 ### 版面保存 Session persistence
 
-- 保存：session 與視窗結構、分割方向與比例、窗格工作目錄（cwd）。版面改變時自動寫入。
-  Saved: session and window structure, split directions and ratios, and pane working directories. Written automatically when the layout changes.
+- 保存：session 與視窗結構、分割方向與比例、窗格目錄（cwd）、agent 名稱與 resume 指令。版面改變時自動寫入。
+  Saved: session and window structure, split directions and ratios, pane directories (cwd), agent names and resume commands. Written automatically when the layout changes.
+- 工作目錄 Working directory：Linux 會即時追蹤窗格前景程序的目錄，保存與回報的 `cwd` 為目前目錄。Windows 與 macOS 不追蹤：保存與回報的 `cwd` 是窗格的啟動目錄，之後的 `cd` 不會反映。
+  On Linux the live directory of the pane's foreground process is tracked, and the saved and reported `cwd` is the current directory. On Windows and macOS it is not tracked: the saved and reported `cwd` is the pane's start directory, and later `cd` commands are not reflected.
 - 不保存：執行中的程式與行程、螢幕內容與捲動回溯、shell 變數與歷程。還原時每個窗格會在保存的 cwd 重新啟動 shell。
   Not saved: running processes, screen contents and scrollback, shell variables and history. On restore each pane starts a new shell in its saved cwd.
-- 位置：`$TMUXLIKE_STATE`；未設定時使用資料目錄。停用：設定檔 `persist = false`，或執行期 `tmuxlike set persist off`。
-  Location: `$TMUXLIKE_STATE`, or the data directory if unset. Disable with `persist = false` in the config or `tmuxlike set persist off` at runtime.
+- Resume 指令：`pane report-agent ... -- RESUME...` 給的指令，還原後會在該窗格的 shell 中輸入並送出（Enter）。tmuxlike 依 POSIX shell 與 PowerShell 的引號規則組成指令，不支援 cmd.exe。第一個參數必須是程式名稱，不可為路徑（如 `./claude`、`C:\...`）；參數不可含單引號（含 PowerShell 的全形引號）或控制字元。不符合時不送出，並記入除錯紀錄。
+  Resume commands: the command given after `--` in `pane report-agent` is typed and submitted (Enter) in the pane's shell after a restore. tmuxlike quotes it by POSIX shell and PowerShell rules; cmd.exe is not supported. The first argument must be a program name, not a path (such as `./claude` or `C:\...`), and arguments may not contain apostrophes (including PowerShell's typographic ones) or control characters. Otherwise nothing is sent and the rejection is logged.
+- 位置：`$TMUXLIKE_STATE`；未設定時使用資料目錄。停用：設定檔 `persist = false`，或執行期 `tmuxlike set persist off`（會立即刪除保存檔）。
+  Location: `$TMUXLIKE_STATE`, or the data directory if unset. Disable with `persist = false` in the config, or `tmuxlike set persist off` at runtime, which deletes the state file immediately.
+- 何時刪除保存檔：關閉最後一個 session（例如 `kill-session`，或 `pane close` 關掉最後一個窗格）時，伺服器會刪除保存檔並結束，因此不會還原。只有 `tmuxlike server stop`，或伺服器異常結束／重新開機，會留下可還原的版面。
+  When the file is deleted: closing the last session (for example with `kill-session`, or `pane close` on the last pane) deletes the state file and the server exits, so nothing is restored. Only `tmuxlike server stop`, or a crash or reboot, leaves a layout to restore.
+- 損毀的保存檔：無法讀取或解析的檔案會移到 `<file>.bad`，伺服器以空白版面啟動；檔案不會被覆寫，供手動檢查。若只還原了部分 session，原始檔會複製為 `<file>.partial.bad`。
+  Damaged state: a file that cannot be read or parsed is moved to `<file>.bad`, and the server starts with an empty layout. The file is never overwritten, so it can be inspected. If only some sessions could be restored, the original is copied to `<file>.partial.bad`.
 - `tmuxlike server stop`：保存後停止伺服器，下次啟動會還原。`tmuxlike kill-server`：關閉所有 session 並刪除保存檔，下次不會還原。
   `server stop` saves and stops the server, so the next start restores the layout. `kill-server` closes everything and deletes the saved file, so nothing is restored.
 
@@ -271,6 +285,8 @@ A `.toml` file replaces the whole config; any other file is run line by line as 
   Single key table (prefix only): no `-n` root bindings, no search in copy mode, single paste buffer
 - 窗格內程式的滑鼠事件不會轉送（滾輪在全螢幕程式中轉為方向鍵）/ Mouse events are not forwarded to apps (wheel becomes arrow keys in full-screen apps)
 - 終端模擬由 `vt100` crate 提供，少數進階序列可能不支援 / Terminal emulation via the `vt100` crate; some advanced sequences may be unsupported
+- 窗格工作目錄只有 Linux 即時追蹤；Windows／macOS 保存與回報的 `cwd` 是窗格啟動目錄 / Live working-directory tracking is Linux only; on Windows and macOS the saved and reported `cwd` is the pane's start directory
+- 還原的 resume 指令只依 POSIX shell 與 PowerShell 的引號規則組成，不支援 cmd.exe / Restored resume commands are quoted for POSIX shells and PowerShell only; cmd.exe is not supported
 - 尚未支援 SSH 遠端機器 / No SSH remote machines yet
 - 尚未支援外掛 / No plugin system yet
 - 不會自動偵測 agent 種類，需由 agent 或 hook 呼叫 `pane report-agent` 回報；否則只有輸出活動推定 / No automatic agent detection: agents or hooks must call `pane report-agent`, otherwise only output-activity inference is available
@@ -283,7 +299,7 @@ Set `TMUXLIKE_LOG=/path/to/file` before starting to get a server debug log (pane
 
 ## 測試 Testing
 
-`cargo test`（單元測試 unit tests）、`python scripts/smoke.py`（CI 在 Linux / macOS / Windows 上執行：背景 session、確認 PowerShell/shell 提示字元、send-keys、ANSI 畫面 / runs on all three OSes in CI）、`python scripts/api_smoke.py`（自動化 API：分割、輸入、agent 狀態、錯誤碼與版面保存；三個平台的 CI 皆執行 / automation API: splits, input, agent status, error codes and layout persistence; runs on all three OSes in CI）與 `python3 scripts/e2e_linux.py`（需 `pip install pyte`，在 Linux 上以虛擬終端驅動實際操作 / drives a real session through a pty on Linux）。
+`cargo test`（單元測試 unit tests）、`python scripts/smoke.py`（CI 在 Linux / macOS / Windows 上執行：背景 session、確認 PowerShell/shell 提示字元、send-keys、ANSI 畫面 / runs on all three OSes in CI）、`python scripts/api_smoke.py`（自動化 API：分割、輸入、換行輸出、agent 狀態、錯誤碼、版面保存，以及關閉最後一個 session 後清除保存檔；三個平台的 CI 皆執行 / automation API: splits, input, wrapped output, agent status, error codes, layout persistence, and clearing the saved state when the last session closes; runs on all three OSes in CI）與 `python3 scripts/e2e_linux.py`（需 `pip install pyte`，在 Linux 上以虛擬終端驅動實際操作 / drives a real session through a pty on Linux）。
 
 ## License
 

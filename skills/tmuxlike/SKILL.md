@@ -44,18 +44,24 @@ tmuxlike pane read "$W" --source recent --lines 80
 
 - `pane run` 成功只代表指令已送入 shell，不代表已執行完成。
 - `wait-output` 會搜尋現有輸出，舊輸出也可能符合。需要精確判斷時，使用只在結果中出現的標記。
-- `--match` 是字面子字串；`--regex` 逐行比對。
+- `--match` 是字面子字串；`--regex` 是正規表示式。兩者都以邏輯行比對：自動換行的列會先接合，跨越換行的字串仍可符合。
+- `--match` and `--regex` both match logical lines: soft-wrapped rows are joined first, so a string longer than the pane still matches.
 
 ## 4. 啟動另一個 agent CLI Start another agent
 
 tmuxlike 沒有 agent 啟動指令。做法是在空白 shell 窗格中用 `pane run` 啟動該 CLI，再讓它回報狀態：
 
 ```sh
-tmuxlike pane run "$W" "claude"        # 使用者指定的 CLI 才啟動
-tmuxlike pane read "$W" --source visible   # 確認已到互動提示
-tmuxlike agent rename "$W" reviewer
+tmuxlike pane run "$W" "claude"             # 使用者指定的 CLI 才啟動
+tmuxlike pane read "$W" --source visible    # 確認已到互動提示
+tmuxlike agent list                          # 等 hook 回報後，$W 才會出現在清單中
+tmuxlike agent rename "$W" reviewer          # 最後才改名
 ```
 
+- **順序：`agent rename` 只對已有回報 agent 的窗格有效。** 必須先啟動 CLI、等它的 hook 呼叫 `pane report-agent`，再執行 `agent rename`。窗格尚未回報時回傳 `agent_not_found`。
+  Order matters: `agent rename` works only after the pane has a reported agent. Start the CLI, wait for its hook to call `pane report-agent`, then rename.
+- **名稱格式：** agent 名稱必須符合 `[a-z][a-z0-9_-]{0,31}`，且不可長得像窗格 ID（例如 `p12`、`%12`），否則回傳 `invalid_argument`。
+  Name format: an agent name must match `[a-z][a-z0-9_-]{0,31}` and must not look like a pane id (such as `p12`); otherwise the reply is `invalid_argument`.
 - 在該 CLI 的 hook 中呼叫 `tmuxlike pane report-agent "$TMUXLIKE_PANE_ID" --source <hook> --agent <kind> --state working|idle|blocked --seq <遞增數字>`。
 - `--seq` 必須遞增；較舊的回報會回傳 `applied: false`，不會生效。
 - 沒有回報時，狀態只是依輸出活動推定，不可視為可靠的完成訊號。
@@ -87,11 +93,13 @@ tmuxlike agent read reviewer --source recent --lines 120
 
 | error.code | 處理 |
 |---|---|
-| `pane_not_found` / `agent_not_found` | 重新執行 `pane list` 或 `agent list` 取得最新 ID |
+| `pane_not_found` | 重新執行 `pane list` 取得最新 ID |
+| `agent_not_found` | 窗格尚未回報 agent：等待 hook 呼叫 `pane report-agent` 後重試；或以 `agent list` 取得最新 ID |
 | `timeout` | 工作可能仍在進行中；先 `read` 再決定是否等待更久 |
 | `agent_blocked` | 不送輸入；讀取畫面並回報使用者 |
 | `invalid_argument` | 修正參數後重試；沒有任何按鍵被送出 |
 | `session_not_found` | 目前沒有 session；回報使用者，不自行建立 |
+| `server_not_running` | 沒有執行中的伺服器（API 指令印出此 JSON 並 exit 1）；回報使用者，不自行啟動伺服器 |
 | exit 2 | 命令語法錯誤，對照上表修正 |
 
 ## 9. 安全 Safety
