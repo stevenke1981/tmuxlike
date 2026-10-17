@@ -131,6 +131,8 @@ impl State {
                     PromptKind::RenameSession => {
                         format!("rename-session \"{}\"", p.buf.replace('"', "\\\""))
                     }
+                    // placeholder until U4 adds y/n handling
+                    PromptKind::Confirm => p.pending.unwrap_or_default(),
                 };
                 if !line.trim().is_empty() {
                     self.run_line(shared, cid, &line);

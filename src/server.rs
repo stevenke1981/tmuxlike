@@ -141,11 +141,55 @@ pub enum PromptKind {
     Command,
     RenameWindow,
     RenameSession,
+    /// y/n question; `Prompt::pending` runs on `y`, anything else cancels
+    Confirm,
 }
 
 pub struct Prompt {
     pub kind: PromptKind,
+    /// input text; for `Confirm` the question shown (without the " (y/n) " suffix)
     pub buf: String,
+    /// cursor position in `buf`, in chars (0..=buf.chars().count())
+    pub cur: usize,
+    /// command line run when a `Confirm` prompt is answered `y`
+    pub pending: Option<String>,
+}
+
+impl Prompt {
+    /// Text prompt with the cursor at the end.
+    pub fn new(kind: PromptKind, buf: String) -> Prompt {
+        let cur = buf.chars().count();
+        Prompt {
+            kind,
+            buf,
+            cur,
+            pending: None,
+        }
+    }
+
+    /// y/n prompt that runs `command` on `y`.
+    pub fn confirm(question: String, command: String) -> Prompt {
+        Prompt {
+            kind: PromptKind::Confirm,
+            buf: question,
+            cur: 0,
+            pending: Some(command),
+        }
+    }
+}
+
+/// Transient status-bar message.
+pub struct Message {
+    pub text: String,
+    pub at: Instant,
+    /// errors render with the error token and stay longer
+    pub error: bool,
+}
+
+impl Message {
+    pub fn ttl(&self) -> Duration {
+        Duration::from_secs(if self.error { 5 } else { 3 })
+    }
 }
 
 pub struct Client {
@@ -156,7 +200,7 @@ pub struct Client {
     pub prompt: Option<Prompt>,
     pub chooser: Option<usize>,
     pub popup: Option<(Vec<String>, usize)>,
-    pub message: Option<(String, Instant)>,
+    pub message: Option<Message>,
     /// mouse drag start: (pane, abs row, col), and whether we moved
     pub drag: Option<(usize, i64, u16, bool)>,
     /// terminal capabilities reported at attach (theme resolution)
@@ -167,6 +211,8 @@ pub struct State {
     pub cfg: Config,
     pub bindings: BTreeMap<String, String>,
     pub buffer: Option<String>,
+    /// `:` prompt history, oldest first (max 50)
+    pub history: Vec<String>,
     pub panes: HashMap<usize, Pane>,
     pub sessions: Vec<Session>,
     pub clients: HashMap<usize, Client>,
@@ -228,8 +274,20 @@ impl State {
     }
 
     pub(crate) fn message(&mut self, cid: usize, msg: impl Into<String>) {
+        self.set_message(cid, msg.into(), false);
+    }
+
+    pub(crate) fn error_message(&mut self, cid: usize, msg: impl Into<String>) {
+        self.set_message(cid, msg.into(), true);
+    }
+
+    fn set_message(&mut self, cid: usize, text: String, error: bool) {
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.message = Some((msg.into(), Instant::now()));
+            c.message = Some(Message {
+                text,
+                at: Instant::now(),
+                error,
+            });
         }
         self.mark_dirty();
     }
@@ -823,7 +881,7 @@ impl State {
                     _ => (PromptKind::Command, String::new()),
                 };
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    c.prompt = Some(Prompt { kind, buf });
+                    c.prompt = Some(Prompt::new(kind, buf));
                 }
             }
             Cmd::RenameWindow(Some(n)) => {
@@ -1198,6 +1256,7 @@ pub fn run() -> Result<()> {
         cfg,
         bindings,
         buffer: None,
+        history: Vec::new(),
         panes: HashMap::new(),
         sessions: vec![],
         clients: HashMap::new(),
@@ -1270,10 +1329,7 @@ pub fn run() -> Result<()> {
                     crate::persist::autosave(&st, &mut last_saved);
                 }
                 for c in st.clients.values_mut() {
-                    if c.message
-                        .as_ref()
-                        .is_some_and(|m| m.1.elapsed() > Duration::from_secs(3))
-                    {
+                    if c.message.as_ref().is_some_and(|m| m.at.elapsed() > m.ttl()) {
                         c.message = None;
                     }
                 }

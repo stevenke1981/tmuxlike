@@ -132,6 +132,8 @@ struct Ctx<'a> {
     h: u16,
     rects: Vec<(usize, Rect)>,
     area: Rect,
+    /// resolved colors/glyphs for this client (config + NO_COLOR/TERM/ASCII)
+    theme: crate::theme::Theme,
 }
 
 /// Truncate to a display width, appending '…' if cut.
@@ -173,6 +175,7 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
         h,
         rects,
         area,
+        theme: crate::theme::Theme::resolve(&st.cfg.theme, &c.env),
     };
     let mut cursor_pos = panes::draw_panes(&mut g, &cx, &mut covered);
     panes::draw_borders(&mut g, &cx, &covered);

@@ -95,6 +95,8 @@ fn draw_prompt_or_message(g: &mut Grid, cx: &Ctx, sy: u16) -> Option<(u16, u16)>
             PromptKind::Command => ":".to_string(),
             PromptKind::RenameWindow => "(rename-window) ".into(),
             PromptKind::RenameSession => "(rename-session) ".into(),
+            // placeholder until U2 draws the y/n bar
+            PromptKind::Confirm => String::new(),
         };
         for x in 0..w {
             g.put(
@@ -118,7 +120,7 @@ fn draw_prompt_or_message(g: &mut Grid, cx: &Ctx, sy: u16) -> Option<(u16, u16)>
         let used = g.text(0, sy, w, shown, Color::Black, Color::Yellow, 0);
         Some((used.min(w - 1), sy))
     } else {
-        if let Some((m, _)) = &c.message {
+        if let Some(crate::server::Message { text: m, .. }) = &c.message {
             for x in 0..w {
                 g.put(
                     x,
