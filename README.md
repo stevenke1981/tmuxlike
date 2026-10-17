@@ -26,6 +26,10 @@ A cross-platform terminal multiplexer written in Rust, inspired by tmux and herd
 - TOML 設定檔；側邊欄與狀態列支援中日韓全形字寬 · TOML config; CJK-width-aware sidebar/status bar
 - 平台後端：Windows 使用 ConPTY + Named Pipe；Linux/macOS 使用 PTY + Unix socket
   Backends: ConPTY + named pipes on Windows; PTY + unix sockets on Linux/macOS
+- JSON 自動化 API：`tmuxlike pane|agent|session|api ...` 以 JSON 列出／分割／輸入／讀取窗格，回報與等待 agent 狀態（見下節）
+  JSON automation API: `tmuxlike pane|agent|session|api ...` lists, splits, types into and reads panes, and reports and waits on agent state (see below)
+- 版面保存：伺服器重啟後還原 session、視窗、分割與窗格工作目錄（`persist`）
+  Layout persistence: sessions, windows, splits and pane directories are restored after a server restart (`persist`)
 
 ## 安裝 Install
 
@@ -120,6 +124,109 @@ bind-key KEY COMMAND...       unbind-key KEY | -a         send-prefix
 
 按鍵名稱 Key names: `c`, `%`, `C-a`, `M-x`, `C-M-Left`, `Up`, `PageUp`, `F5`, `Space`, `Enter`, `Escape`, `BSpace`, `^A`…
 
+## 自動化 API Automation API (herdr-style)
+
+以 JSON 指令透過同一個本機 socket 操作伺服器，讓 script 或 coding agent 可以列出、分割、輸入與讀取窗格，並回報與等待 agent 狀態。不需要另外啟動程式。
+A JSON command interface over the same local socket, so scripts and coding agents can list, split, type into and read panes, and report and wait on agent state. No extra process is needed.
+
+### 慣例 Conventions
+
+- 成功：stdout 印出 `{"result": ...}`，exit 0；`pane read` 與 `agent read` 直接印出純文字。
+  Success: `{"result": ...}` on stdout with exit 0; `pane read` and `agent read` print raw text.
+- 失敗：stderr 印出 `{"error": {"code": "...", "message": "..."}}`，exit 1。命令語法錯誤（例如未知選項）exit 2。
+  Failure: `{"error": {"code", "message"}}` on stderr with exit 1. Syntax errors (for example an unknown option) exit 2.
+- 常見錯誤代碼 Common codes: `pane_not_found`, `agent_not_found`, `session_not_found`, `invalid_argument`, `timeout`, `agent_blocked`, `name_taken`, `no_neighbor`, `spawn_failed`, `internal`.
+- 窗格 ID 為 `p<N>`，同一次伺服器執行期間不變；伺服器重啟後請重新以 `pane list` 查詢。也接受 tmux 風格的 `%N`。
+  Pane IDs are `p<N>` (also accepts tmux-style `%N`). They are stable while one server runs; query `pane list` again after a restart.
+- 每個窗格的環境變數 `TMUXLIKE_PANE_ID` 即是該窗格的 ID；`--current` 指向呼叫者所在窗格。省略 ID 時，目標為最近使用之 session 的焦點窗格。
+  Each pane has `TMUXLIKE_PANE_ID` set to its own ID; `--current` targets the calling pane. An omitted ID means the focused pane of the most recently used session.
+
+### 指令 Commands
+
+| 群組 Group | 指令 Command | 說明 Description |
+|---|---|---|
+| pane | `pane list [--session S]` | 列出窗格 List panes |
+| pane | `pane get <id>` | 單一窗格資料 One pane |
+| pane | `pane current [--pane ID \| --current]` | 查詢目前窗格 Current pane |
+| pane | `pane split [ID] --direction right\|down [--ratio F] [--cwd P] [--focus\|--no-focus]` | 分割窗格，預設不改變焦點 Split; focus unchanged by default |
+| pane | `pane focus <id>` / `pane focus --direction D` | 移動焦點 Move focus |
+| pane | `pane zoom [ID] [--toggle\|--on\|--off]` | 縮放 Zoom |
+| pane | `pane rename <id> <label>` / `--clear` | 設定窗格標籤 Pane label |
+| pane | `pane close <id>` | 關閉窗格 Close pane |
+| pane | `pane read <id> [--source visible\|recent] [--lines N]` | 讀取文字 Read text |
+| pane | `pane send-text <id> <text>` | 輸入文字，不送出 Enter Type text, no Enter |
+| pane | `pane send-keys <id> <key>...` | 送出按鍵，例如 `enter`、`ctrl+c`、`esc`、`up`、`f1` Send keys |
+| pane | `pane run <id> <cmd>` | 輸入指令並按 Enter Type a command and press Enter |
+| pane | `pane wait-output <id> --match T \| --regex R [--lines N] [--timeout MS]` | 等待輸出出現 Wait for output |
+| pane | `pane report-agent <id> --source S --agent L --state S [--message T] [--seq N] [-- RESUME...]` | 回報 agent 狀態 Report agent state |
+| pane | `pane release-agent <id> --source S --agent L` | 釋放回報的 agent 狀態 Release reported state |
+| agent | `agent list` | 列出 agent List agents |
+| agent | `agent get\|read\|send-keys\|focus <target>` | 查詢、讀取、送鍵、聚焦 Inspect, read, send keys, focus |
+| agent | `agent rename <target> <name>` / `--clear` | 設定唯一名稱 Set a unique name |
+| agent | `agent wait <target> [--until S]... [--timeout MS]` | 等待狀態 Wait for a state |
+| agent | `agent prompt <target> <text> [--wait] [--until S] [--timeout MS]` | 送出提示；被 blocked 時回傳 `agent_blocked` Submit a prompt |
+| session / server | `session list` | 列出 session List sessions |
+| session / server | `api snapshot` | 完整快照 Full snapshot |
+| session / server | `server stop` | 保存版面後停止伺服器 Save layout, then stop the server |
+| session / server | `kill-server` | 關閉所有 session 並刪除保存的版面 Close everything and delete the saved layout |
+
+`<target>` 可以是窗格 ID 或唯一的 agent 名稱。`<target>` is a pane ID or a unique agent name.
+
+### Agent 狀態 Agent status
+
+| 狀態 State | 符號 | 意義 Meaning |
+|---|---|---|
+| working | ● | 執行中 Busy |
+| blocked | ▲ | 等待核准或提問 Waiting for approval or a question |
+| done | ◆ | 閒置，且有尚未查看的輸出 Idle, with output not yet viewed |
+| idle | ○ | 閒置 Idle |
+| unknown | ? | 無法可靠判斷，不代表已完成 Cannot classify; does not mean finished |
+
+- 有回報時以回報為準：`pane report-agent` 的 `--seq` 必須較新才會套用，過期的回報回傳 `applied: false`。
+  Reported state wins: `pane report-agent` applies only a newer `--seq`; a stale report returns `applied: false`.
+- 沒有回報時以輸出活動推定：`busy-secs` 內有輸出為 working，否則有未查看的輸出為 done，其餘為 idle。tmuxlike 不會自動偵測 agent 種類。
+  Without a report, status is inferred from output activity: output within `busy-secs` means working, unseen output means done, otherwise idle. tmuxlike does not detect agent kinds automatically.
+
+### 範例 Examples
+
+1. 分割、執行並等待輸出 Split, run, and wait for output：
+
+```sh
+pane=$(tmuxlike pane split --current --direction right --cwd "$PWD" --no-focus | jq -r .result.pane.pane_id)
+tmuxlike pane run "$pane" "cargo test"
+tmuxlike pane wait-output "$pane" --regex "test result" --timeout 120000
+tmuxlike pane read "$pane" --source recent --lines 60
+```
+
+   Windows PowerShell：`$pane = (tmuxlike pane split --current --direction right --no-focus | ConvertFrom-Json).result.pane.pane_id`
+
+2. Agent 回報 hook Agent report hook（在 agent 窗格內執行 run inside the agent's pane）：
+
+```sh
+tmuxlike pane report-agent "$TMUXLIKE_PANE_ID" --source my-hook --agent claude --state working --seq "$SEQ"
+# 另一個 script 等待它閒置 another script waits for idle
+tmuxlike agent wait "$TMUXLIKE_PANE_ID" --until idle --timeout 600000
+```
+
+3. 送出提示並等待 Prompt and wait：
+
+```sh
+tmuxlike agent rename p4 reviewer
+tmuxlike agent prompt reviewer "review the diff" --wait --until idle --timeout 300000
+tmuxlike agent read reviewer --source recent --lines 80
+```
+
+### 版面保存 Session persistence
+
+- 保存：session 與視窗結構、分割方向與比例、窗格工作目錄（cwd）。版面改變時自動寫入。
+  Saved: session and window structure, split directions and ratios, and pane working directories. Written automatically when the layout changes.
+- 不保存：執行中的程式與行程、螢幕內容與捲動回溯、shell 變數與歷程。還原時每個窗格會在保存的 cwd 重新啟動 shell。
+  Not saved: running processes, screen contents and scrollback, shell variables and history. On restore each pane starts a new shell in its saved cwd.
+- 位置：`$TMUXLIKE_STATE`；未設定時使用資料目錄。停用：設定檔 `persist = false`，或執行期 `tmuxlike set persist off`。
+  Location: `$TMUXLIKE_STATE`, or the data directory if unset. Disable with `persist = false` in the config or `tmuxlike set persist off` at runtime.
+- `tmuxlike server stop`：保存後停止伺服器，下次啟動會還原。`tmuxlike kill-server`：關閉所有 session 並刪除保存檔，下次不會還原。
+  `server stop` saves and stops the server, so the next start restores the layout. `kill-server` closes everything and deletes the saved file, so nothing is restored.
+
 ## 設定 Configuration
 
 路徑 Path: `$TMUXLIKE_CONFIG`，或 or
@@ -137,6 +244,7 @@ sidebar_width = 28
 busy_secs = 1.5         # 最後輸出後幾秒內視為 working / seconds after output counted as "working"
 automatic_rename = true # 依前景程式自動命名視窗 / auto-name windows
 osc52 = true            # 複製時寫入系統剪貼簿 / copy to system clipboard via OSC 52
+persist = true          # 保存並還原版面 / save and restore the layout across server restarts
 
 unbind = ["x"]          # 移除預設按鍵；"all" 移除全部 / remove defaults ("all" = every default)
 commands = ["set busy-secs 2"]   # 載入後執行的指令 / commands run after loading
@@ -147,12 +255,12 @@ v = "split-window -h"
 "M-1" = "select-window -t 1"
 ```
 
-`set` 可用選項 options: `prefix`, `shell`, `mouse`, `sidebar`, `sidebar-width`, `scrollback`/`history-limit`（僅影響新窗格 new panes only）, `busy-secs`, `automatic-rename`, `osc52`/`set-clipboard`.
+`set` 可用選項 options: `prefix`, `shell`, `mouse`, `sidebar`, `sidebar-width`, `scrollback`/`history-limit`（僅影響新窗格 new panes only）, `busy-secs`, `automatic-rename`, `osc52`/`set-clipboard`, `persist`.
 
 重新載入 Reload: `prefix r`、`:source-file [PATH]` 或 `tmuxlike source-file`。`.toml` 檔會整個取代設定；其他副檔名視為每行一條指令（類似 `.tmux.conf`）。
 A `.toml` file replaces the whole config; any other file is run line by line as commands (like `.tmux.conf`).
 
-環境變數 Env: `TMUXLIKE_SOCKET` 可指定 socket 名稱以執行多個獨立伺服器 / set to run independent servers.
+環境變數 Env: `TMUXLIKE_SOCKET` 可指定 socket 名稱以執行多個獨立伺服器 / set to run independent servers; `TMUXLIKE_STATE` 指定版面保存檔路徑 / path of the saved-layout file.
 
 ## 限制 Limitations
 
@@ -163,6 +271,10 @@ A `.toml` file replaces the whole config; any other file is run line by line as 
   Single key table (prefix only): no `-n` root bindings, no search in copy mode, single paste buffer
 - 窗格內程式的滑鼠事件不會轉送（滾輪在全螢幕程式中轉為方向鍵）/ Mouse events are not forwarded to apps (wheel becomes arrow keys in full-screen apps)
 - 終端模擬由 `vt100` crate 提供，少數進階序列可能不支援 / Terminal emulation via the `vt100` crate; some advanced sequences may be unsupported
+- 尚未支援 SSH 遠端機器 / No SSH remote machines yet
+- 尚未支援外掛 / No plugin system yet
+- 不會自動偵測 agent 種類，需由 agent 或 hook 呼叫 `pane report-agent` 回報；否則只有輸出活動推定 / No automatic agent detection: agents or hooks must call `pane report-agent`, otherwise only output-activity inference is available
+- 尚未支援 git worktree，以及 workspace／tab API（目前以 session／視窗對應）/ No git worktrees and no workspace/tab API yet (sessions and windows are used instead)
 
 ## 疑難排解 Troubleshooting
 
@@ -171,7 +283,7 @@ Set `TMUXLIKE_LOG=/path/to/file` before starting to get a server debug log (pane
 
 ## 測試 Testing
 
-`cargo test`（單元測試 unit tests）、`python scripts/smoke.py`（CI 在 Linux / macOS / Windows 上執行：背景 session、確認 PowerShell/shell 提示字元、send-keys、ANSI 畫面 / runs on all three OSes in CI）與 `python3 scripts/e2e_linux.py`（需 `pip install pyte`，在 Linux 上以虛擬終端驅動實際操作 / drives a real session through a pty on Linux）。
+`cargo test`（單元測試 unit tests）、`python scripts/smoke.py`（CI 在 Linux / macOS / Windows 上執行：背景 session、確認 PowerShell/shell 提示字元、send-keys、ANSI 畫面 / runs on all three OSes in CI）、`python scripts/api_smoke.py`（自動化 API：分割、輸入、agent 狀態、錯誤碼與版面保存；三個平台的 CI 皆執行 / automation API: splits, input, agent status, error codes and layout persistence; runs on all three OSes in CI）與 `python3 scripts/e2e_linux.py`（需 `pip install pyte`，在 Linux 上以虛擬終端驅動實際操作 / drives a real session through a pty on Linux）。
 
 ## License
 
