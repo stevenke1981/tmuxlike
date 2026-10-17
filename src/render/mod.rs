@@ -11,7 +11,7 @@ mod status;
 pub use overlay::{
     Entry, Filter, chooser_entries, kill_target, pack_chooser, unpack_chooser, visible_entries,
 };
-pub use status::{status_hit, status_regions};
+pub use status::{status_hit_at, status_regions};
 
 use crate::layout::Rect;
 use crate::server::{Client, Session, State};

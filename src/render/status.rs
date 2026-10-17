@@ -4,14 +4,12 @@
 //! Geometry is pure ([`status_layout`], [`which_key`], [`prompt_view`]). Drawing paints the
 //! segments that layout returns, and the window hit ranges come from the same output, so a
 //! click lands on the columns that were drawn.
-use super::{BOLD, Cell, Ctx, Grid, INVERSE};
+use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, cut};
 use crate::api::{Status, agent};
 
-use crate::server::{Client, Prompt, PromptKind, Session, State, Window};
-use crate::theme::Theme;
+use crate::server::{Client, Message, Prompt, PromptKind, Session, State, Window};
+use crate::theme::{Glyphs, Theme};
 use crossterm::style::Color;
-use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
 
 mod text;
 use text::*;
@@ -54,7 +52,7 @@ type Style = (Color, Color, u8);
 /// Semantic role of a run of cells; `tone_style` maps it to tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tone {
-    /// bar foreground on the bar background
+    /// bar foreground on the bar background; neutral info notices
     Bar,
     /// accent chip: session name, active window
     Chip,
@@ -62,7 +60,7 @@ pub(crate) enum Tone {
     Warn,
     /// blocked-token chip: confirm row
     Danger,
-    /// hints and markers
+    /// hints and markers: bar foreground, faint (SGR 2) so it stays readable on any bar color
     Muted,
     /// attention label: bold warn text
     Attention,
@@ -138,10 +136,12 @@ pub(crate) enum Right {
     Copy,
     /// transient message chip over the counts block
     Message {
-        glyph: &'static str,
+        glyph: Glyph,
         text: String,
-        error: bool,
     },
+    /// nothing at the right end (session-only hit testing, see [`status_hit`])
+    #[cfg_attr(not(test), allow(dead_code))] // session-only layouts in tests
+    None,
 }
 
 /// Everything the normal status row depends on, for one client frame.
@@ -176,30 +176,75 @@ impl Unit {
     }
 }
 
+/// Chip glyph and the token of the whole message chip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Glyph {
+    pub text: &'static str,
+    pub tone: Tone,
+}
+
+/// Glyph for a status-bar message. Errors use the error glyph and token; `copied` and
+/// `sourced` report success (`ok`); anything else is a neutral notice (`info`, bar color).
+pub(crate) fn message_glyph(msg: &Message, g: &Glyphs) -> Glyph {
+    if msg.error {
+        return Glyph {
+            text: g.err,
+            tone: Tone::Err,
+        };
+    }
+    if msg.text.starts_with("copied") || msg.text.starts_with("sourced") {
+        return Glyph {
+            text: g.ok,
+            tone: Tone::Ok,
+        };
+    }
+    Glyph {
+        text: g.info,
+        tone: Tone::Bar,
+    }
+}
+
 /// Right-block alternative; `full` marks the one that still carries the `? help` text.
 struct Alt {
     units: Vec<Unit>,
     full: bool,
 }
 
-/// Window hit ranges: (window index, start col, end col exclusive).
-type HitRanges = Vec<(usize, u16, u16)>;
-
-/// Hit ranges of the last normal status row drawn per session name.
-static HITS: Mutex<BTreeMap<String, HitRanges>> = Mutex::new(BTreeMap::new());
-
-/// Window index under column `col` of the status row last drawn for `s`.
+/// Window index under column `col` of the status row this client would see now. Same input
+/// and layout as the drawer, computed on demand (no per-frame state).
 ///
-/// The layout depends on agent state (glyphs, flags, counts), so the ranges are the ones
-/// the last frame drew for this session.
-pub fn status_hit(s: &Session, col: u16) -> Option<usize> {
-    let map = HITS.lock().unwrap_or_else(PoisonError::into_inner);
-    hit_at(map.get(&s.name)?, col)
+/// Empty (`None`) while a prompt or the which-key bar owns the row, as the drawer does.
+pub fn status_hit_at(st: &State, c: &Client, s: &Session, col: u16) -> Option<usize> {
+    if c.prompt.is_some() || c.prefix {
+        return None;
+    }
+    let theme = Theme::resolve(&st.cfg.theme, &c.env);
+    let layout = status_layout(&status_input(st, s, c, &theme), s.cols);
+    hit_at(&layout.hits, col)
 }
 
-fn remember_hits(session: &str, hits: Vec<(usize, u16, u16)>) {
-    let mut map = HITS.lock().unwrap_or_else(PoisonError::into_inner);
-    map.insert(session.to_string(), hits);
+/// Compatibility wrapper for callers without a client or state: the session's windows only,
+/// with no agent glyphs, no attention flags and no right block. Hit ranges match the drawn
+/// row only when the bar has no glyphs and no right-side text, so prefer [`status_hit_at`].
+#[cfg(test)]
+pub fn status_hit(s: &Session, col: u16) -> Option<usize> {
+    let inp = StatusInput {
+        session: s.name.clone(),
+        wins: s
+            .windows
+            .iter()
+            .map(|w| WinItem {
+                name: w.name.clone(),
+                glyph: None,
+                attention: false,
+                zoomed: w.zoomed,
+            })
+            .collect(),
+        active: s.active,
+        ellipsis: crate::theme::UNICODE.ellipsis,
+        right: Right::None,
+    };
+    hit_at(&status_layout(&inp, s.cols).hits, col)
 }
 
 fn hit_at(hits: &[(usize, u16, u16)], col: u16) -> Option<usize> {
@@ -409,7 +454,10 @@ fn session_cut(inp: &StatusInput, lo: usize, hi: usize, budget: u16) -> Vec<Unit
     if room < 3 {
         return rest;
     }
-    let chip = format!(" {} ", cut(&inp.session, room - 2, inp.ellipsis));
+    let chip = format!(
+        " {} ",
+        cut(&inp.session, usize::from(room - 2), inp.ellipsis)
+    );
     let mut v = vec![Unit::new(chip, Tone::Chip)];
     v.extend(rest);
     v
@@ -419,9 +467,8 @@ fn right_block(inp: &StatusInput, w: u16, left_w: u16) -> (Vec<Unit>, u16) {
     match &inp.right {
         Right::Bar { counts, tail } => bar_right(counts, tail, w, left_w),
         Right::Copy => copy_right(w, left_w, inp.ellipsis),
-        Right::Message { glyph, text, error } => {
-            message_right(glyph, text, *error, w, left_w, inp.ellipsis)
-        }
+        Right::Message { glyph, text } => message_right(*glyph, text, w, left_w, inp.ellipsis),
+        Right::None => (vec![], GAP),
     }
 }
 
@@ -510,22 +557,20 @@ fn copy_right(w: u16, left_w: u16, ell: &str) -> (Vec<Unit>, u16) {
         .saturating_sub(1)
         .saturating_sub(chip.width());
     if room >= 4 {
-        return (vec![chip, Unit::new(cut(&hint, room, ell), Tone::Muted)], 0);
+        return (
+            vec![
+                chip,
+                Unit::new(cut(&hint, usize::from(room), ell), Tone::Muted),
+            ],
+            0,
+        );
     }
     (vec![chip], 0)
 }
 
-fn message_right(
-    glyph: &str,
-    text: &str,
-    error: bool,
-    w: u16,
-    left_w: u16,
-    ell: &str,
-) -> (Vec<Unit>, u16) {
-    let tone = if error { Tone::Err } else { Tone::Ok };
-    let full_text = format!(" {glyph} {text}");
-    let full = vec![Unit::new(full_text.clone(), tone)];
+fn message_right(glyph: Glyph, text: &str, w: u16, left_w: u16, ell: &str) -> (Vec<Unit>, u16) {
+    let full_text = format!(" {} {text}", glyph.text);
+    let full = vec![Unit::new(full_text.clone(), glyph.tone)];
     if fits_uncut(left_w, &full, 0, w) {
         return (full, 0);
     }
@@ -533,7 +578,8 @@ fn message_right(
     if cap < 2 {
         return (vec![], 0);
     }
-    (vec![Unit::new(cut(&full_text, cap, ell), tone)], 0)
+    let cut_text = cut(&full_text, usize::from(cap), ell);
+    (vec![Unit::new(cut_text, glyph.tone)], 0)
 }
 
 fn tone_style(t: &Theme, tone: Tone) -> Style {
@@ -543,7 +589,7 @@ fn tone_style(t: &Theme, tone: Tone) -> Style {
         Tone::Chip => solid(t, t.accent, BOLD),
         Tone::Warn => solid(t, t.warn, BOLD),
         Tone::Danger => solid(t, t.blocked, BOLD),
-        Tone::Muted => (t.c(t.muted), t.c(t.bar_bg), 0),
+        Tone::Muted => (t.c(t.bar_fg), t.c(t.bar_bg), DIM),
         Tone::Attention => (t.c(t.warn), t.c(t.bar_bg), BOLD),
         Tone::Status(s) => {
             let (_, color, _) = t.status(s);
@@ -593,12 +639,10 @@ pub(super) fn draw_status(g: &mut Grid, cx: &Ctx) -> Option<(u16, u16)> {
     let sy = cx.h.saturating_sub(1);
     let t = &cx.theme;
     if let Some(p) = &cx.c.prompt {
-        remember_hits(&cx.s.name, Vec::new());
         return draw_prompt(g, cx, sy, p);
     }
     fill_row(g, sy, cx.w, tone_style(t, Tone::Bar));
     if cx.c.prefix {
-        remember_hits(&cx.s.name, Vec::new());
         let segs = [
             Seg {
                 x: 0,
@@ -616,7 +660,6 @@ pub(super) fn draw_status(g: &mut Grid, cx: &Ctx) -> Option<(u16, u16)> {
     }
     let layout = status_layout(&status_input(cx.st, cx.s, cx.c, &cx.theme), cx.w);
     paint(g, sy, &layout.segs, t);
-    remember_hits(&cx.s.name, layout.hits);
     None
 }
 
@@ -668,11 +711,9 @@ fn status_input(st: &State, s: &Session, c: &Client, theme: &Theme) -> StatusInp
 
 fn right_of(st: &State, s: &Session, c: &Client, theme: &Theme) -> Right {
     if let Some(m) = &c.message {
-        let glyph = if m.error { theme.g.err } else { theme.g.ok };
         return Right::Message {
-            glyph,
+            glyph: message_glyph(m, &theme.g),
             text: m.text.clone(),
-            error: m.error,
         };
     }
     if in_copy_mode(st, s) {

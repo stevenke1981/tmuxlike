@@ -139,10 +139,7 @@ fn session_text_uses_plural_and_attached_tag() {
 fn window_and_pane_text_plurals_and_markers() {
     assert_eq!(window_text(0, "cmd", true, 1), "0: cmd*  1 pane");
     assert_eq!(window_text(2, "logs", false, 3), "2: logs  3 panes");
-    assert_eq!(
-        pane_text(0, 1, "codex", Status::Working),
-        "0.1 codex working"
-    );
+    assert_eq!(pane_text(0, 1, "codex"), "0.1 codex");
     assert_eq!(count_noun(1, "window", "windows"), "1 window");
     assert_eq!(count_noun(0, "pane", "panes"), "0 panes");
 }
@@ -152,9 +149,48 @@ fn row_text_for_session_window_pane() {
     let rows = chooser_rows(&sample(), Filter::All, &UNICODE);
     assert_eq!(rows[0].text, "demo: 2 windows (attached)");
     assert!(rows[0].bold);
+    assert_eq!(rows[0].word, None);
     assert_eq!(rows[1].text, "0: cmd*  2 panes");
-    assert_eq!(rows[2].text, "0.0 claude blocked");
+    assert_eq!(rows[1].word, None);
+    assert_eq!(rows[2].text, "0.0 claude");
+    assert_eq!(
+        rows[2].word,
+        Some("blocked"),
+        "state word is its own muted run"
+    );
     assert_eq!(rows[2].status, Status::Blocked);
+}
+
+#[test]
+fn muted_chrome_is_faint_in_mono_and_muted_color_otherwise() {
+    let color = Theme::terminal();
+    assert_eq!(muted_style(&color), (color.muted, 0));
+    let mono = Theme {
+        mono: true,
+        ..Theme::terminal()
+    };
+    assert_eq!(muted_style(&mono), (Color::Reset, DIM));
+}
+
+#[test]
+fn chooser_footer_in_ascii_theme_is_ascii() {
+    let ascii = Theme {
+        ascii: true,
+        g: ASCII,
+        ..Theme::terminal()
+    };
+    let footer = chooser_hints(&ascii.g);
+    assert!(footer.is_ascii(), "{footer:?}");
+    assert!(footer.contains("esc close"));
+}
+
+#[test]
+fn ascii_chooser_rows_and_titles_stay_ascii() {
+    let rows = chooser_rows(&sample(), Filter::All, &ASCII);
+    for r in &rows {
+        assert!(r.prefix.is_ascii() && r.text.is_ascii(), "{r:?}");
+    }
+    assert!(chooser_title(Filter::Only(Status::Done)).is_ascii());
 }
 
 #[test]

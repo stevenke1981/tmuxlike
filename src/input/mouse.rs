@@ -1,12 +1,12 @@
 //! Mouse input: click to focus and select, drag to copy, wheel to scroll.
 //!
 //! Click targets match what is drawn: sidebar lines come from `sidebar_rows`, window labels
-//! from `status_hit`, and the session chip and counters from `status_regions` (same layout).
+//! from `status_hit_at`, and the session chip and counters from `status_regions` (same layout).
 //! Overlays (chooser, key popup) take the wheel; any click closes them, as before.
 use crate::copy::{self, CopyState};
 use crate::layout::Rect;
 use crate::render::{
-    SidebarKind, pack_chooser, sidebar_rows, sidebar_text_width, status_hit, status_regions,
+    SidebarKind, pack_chooser, sidebar_rows, sidebar_text_width, status_hit_at, status_regions,
     unpack_chooser, visible_entries,
 };
 use crate::server::State;
@@ -128,10 +128,10 @@ impl State {
     /// Status row: the session chip opens the chooser, window labels switch windows, and the
     /// counters run `next-attention`.
     fn click_status(&mut self, cid: usize, si: usize, col: u16) -> Option<String> {
-        let regions = self
-            .clients
-            .get(&cid)
-            .map(|c| status_regions(self, c, &self.sessions[si]))?;
+        let (regions, hit) = self.clients.get(&cid).map(|c| {
+            let s = &self.sessions[si];
+            (status_regions(self, c, s), status_hit_at(self, c, s, col))
+        })?;
         let inside = |span: Option<(u16, u16)>| span.is_some_and(|(a, b)| col >= a && col < b);
         if inside(regions.session) {
             return Some("choose-tree".into());
@@ -139,7 +139,7 @@ impl State {
         if inside(regions.counts) {
             return Some("next-attention".into());
         }
-        if let Some(wi) = status_hit(&self.sessions[si], col) {
+        if let Some(wi) = hit {
             self.sessions[si].active = wi;
             self.relayout(si);
         }

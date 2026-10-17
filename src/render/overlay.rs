@@ -4,12 +4,12 @@
 //! targets are pure functions over a [`NodeSession`] snapshot, so they are unit-tested without
 //! ptys. `Client.chooser` stores the selected row and the filter packed in one `usize`
 //! (see [`pack_chooser`]), so the server needs no new field.
-use super::{BOLD, Cell, Ctx, Grid, INVERSE};
+use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, cut};
 use crate::api::Status;
 use crate::server::{Pane, State};
 use crate::theme::{ASCII, Glyphs, Theme};
 use crossterm::style::Color;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 /// Chooser row: (session index, window index, pane index). `None` marks a level above the row.
 pub type Entry = (usize, Option<usize>, Option<usize>);
@@ -216,12 +216,14 @@ fn filter_entries(tree: &[NodeSession], filter: Filter) -> Vec<Entry> {
         .collect()
 }
 
-/// One chooser line before drawing.
+/// One chooser line before drawing. `word` is the state word of a pane row, drawn muted after
+/// the text.
 #[derive(Debug, Clone, PartialEq)]
 struct Row {
     status: Status,
     prefix: String,
     text: String,
+    word: Option<&'static str>,
     bold: bool,
 }
 
@@ -230,10 +232,13 @@ fn chooser_rows(tree: &[NodeSession], filter: Filter, g: &Glyphs) -> Vec<Row> {
     (0..entries.len())
         .map(|i| {
             let (prefix, text, bold) = row_art(tree, &entries, i, g);
+            let status = status_of(tree, entries[i]);
+            let word = entries[i].2.map(|_| status_word(status));
             Row {
-                status: status_of(tree, entries[i]),
+                status,
                 prefix,
                 text,
+                word,
                 bold,
             }
         })
@@ -287,7 +292,7 @@ fn row_art(
             let pane = &s.windows[w].panes[p];
             (
                 format!("{cont}{branch} "),
-                pane_text(w, p, &pane.who, pane.status),
+                pane_text(w, p, &pane.who),
                 false,
             )
         }
@@ -343,8 +348,9 @@ fn window_text(index: usize, name: &str, active: bool, panes: usize) -> String {
     )
 }
 
-fn pane_text(window: usize, pane: usize, who: &str, status: Status) -> String {
-    format!("{window}.{pane} {who} {}", status_word(status))
+/// Pane row text without its state word (that is drawn muted by [`Row::word`]).
+fn pane_text(window: usize, pane: usize, who: &str) -> String {
+    format!("{window}.{pane} {who}")
 }
 
 fn status_word(s: Status) -> &'static str {
@@ -411,11 +417,13 @@ fn arg_quote(s: &str) -> String {
 
 /// One drawable line inside an overlay box.
 struct Line {
-    /// tree art, dim
+    /// tree art, muted (faint in mono)
     pre: String,
     /// state glyph and its color, drawn before the text
     glyph: Option<Status>,
     text: String,
+    /// state word after the text, muted
+    word: Option<&'static str>,
     bold: bool,
     muted: bool,
 }
@@ -426,6 +434,7 @@ impl Line {
             pre: String::new(),
             glyph: None,
             text: text.to_string(),
+            word: None,
             bold: false,
             muted: false,
         }
@@ -443,13 +452,17 @@ impl Line {
             pre: r.prefix.clone(),
             glyph: Some(r.status),
             text: r.text.clone(),
+            word: r.word,
             bold: r.bold,
             muted: false,
         }
     }
 
     fn width(&self) -> usize {
-        self.pre.width() + if self.glyph.is_some() { 2 } else { 0 } + self.text.width()
+        self.pre.width()
+            + if self.glyph.is_some() { 2 } else { 0 }
+            + self.text.width()
+            + self.word.map_or(0, |w| 1 + w.width())
     }
 }
 
@@ -496,27 +509,10 @@ fn empty_note(filter: Filter) -> String {
     }
 }
 
-/// Cut `s` to `max` display columns, ending with `ell` when shortened. Never splits a wide char.
-fn cut(s: &str, max: usize, ell: &str) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let budget = max.saturating_sub(ell.width());
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw > budget {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push_str(ell);
-    out
+/// Muted chrome (hints, footers, state words, notes): the `muted` color, or SGR 2 in mono.
+/// Returns (fg, attributes).
+fn muted_style(t: &Theme) -> (Color, u8) {
+    (t.c(t.muted), if t.mono { DIM } else { 0 })
 }
 
 /// Selected-row style: selection color with the bar foreground, or inverse video in mono.
@@ -590,14 +586,15 @@ fn draw_box(g: &mut Grid, cx: &Ctx, spec: &BoxSpec) {
         BOLD,
         scroll_marker(cx, up, down).as_deref(),
     );
+    let (muted_fg, muted_attr) = muted_style(&cx.theme);
     border_label(
         g,
         cx,
         geom,
         geom.y + geom.h - 1,
         spec.footer,
-        cx.theme.c(cx.theme.muted),
-        0,
+        muted_fg,
+        muted_attr,
         None,
     );
     for (k, line) in spec.lines.iter().enumerate().skip(start).take(inner_h) {
@@ -657,15 +654,8 @@ fn border_label(
         room = room.saturating_sub(mw);
         let mx = (b.x + b.w).saturating_sub(2 + mw as u16);
         let shown = format!(" {m} ");
-        g.text(
-            mx,
-            y,
-            mw as u16,
-            &shown,
-            cx.theme.c(cx.theme.muted),
-            Color::Reset,
-            0,
-        );
+        let (muted_fg, muted_attr) = muted_style(&cx.theme);
+        g.text(mx, y, mw as u16, &shown, muted_fg, Color::Reset, muted_attr);
     }
     if room < 3 {
         return;
@@ -699,12 +689,17 @@ fn draw_row(g: &mut Grid, cx: &Ctx, x0: u16, y: u16, inner_w: usize, line: &Line
             );
         }
     }
+    let (muted_fg, muted_attr) = muted_style(t);
     let mut segs: Vec<(String, Color, u8)> = Vec::new();
     let mut used = 0;
     if !line.pre.is_empty() {
         used += line.pre.width();
-        let fg = if selected { base_fg } else { t.c(t.border) };
-        segs.push((line.pre.clone(), fg, base_attr));
+        let (fg, attr) = if selected {
+            (base_fg, base_attr)
+        } else {
+            (t.c(t.border), base_attr | muted_attr)
+        };
+        segs.push((line.pre.clone(), fg, attr));
     }
     if let Some(status) = line.glyph {
         let (glyph, color, _) = t.status(status);
@@ -714,13 +709,27 @@ fn draw_row(g: &mut Grid, cx: &Ctx, x0: u16, y: u16, inner_w: usize, line: &Line
         segs.push((glyph.to_string(), fg, attr));
         segs.push((" ".to_string(), base_fg, base_attr));
     }
-    let text_fg = if line.muted && !selected {
-        t.c(t.muted)
+    let word = line.word.map(|w| format!(" {w}")).unwrap_or_default();
+    let (text_fg, text_muted) = if line.muted && !selected {
+        (muted_fg, muted_attr)
     } else {
-        base_fg
+        (base_fg, 0)
     };
-    let text = cut(&line.text, inner_w.saturating_sub(used), t.g.ellipsis);
-    segs.push((text, text_fg, base_attr | if line.bold { BOLD } else { 0 }));
+    let bold = if line.bold { BOLD } else { 0 };
+    let text = cut(
+        &line.text,
+        inner_w.saturating_sub(used + word.width()),
+        t.g.ellipsis,
+    );
+    segs.push((text, text_fg, base_attr | text_muted | bold));
+    if !word.is_empty() {
+        let (fg, attr) = if selected {
+            (base_fg, base_attr)
+        } else {
+            (muted_fg, base_attr | muted_attr)
+        };
+        segs.push((word, fg, attr));
+    }
     let mut x = x0;
     for (s, fg, attr) in segs {
         let room = end.saturating_sub(x);

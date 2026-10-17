@@ -1,5 +1,10 @@
 use super::*;
 use crate::commands::DEFAULT_BINDINGS;
+use crate::layout::Node;
+use crate::server::{Message, Window};
+use crate::theme::{ASCII, UNICODE};
+use crossterm::style::Color;
+use std::collections::BTreeMap;
 
 fn win(name: &str) -> WinItem {
     WinItem {
@@ -147,26 +152,177 @@ fn hit_columns_are_exactly_the_drawn_labels() {
     }
 }
 
-#[test]
-fn status_hit_reads_the_last_drawn_ranges() {
-    let inp = input("hit-cache-s", vec![win("a"), win("b")], 0, key_bar("C-b"));
-    let layout = status_layout(&inp, 40);
-    remember_hits("hit-cache-s", layout.hits.clone());
-    let sess = Session {
-        name: "hit-cache-s".into(),
-        windows: vec![],
+fn session_with(name: &str, windows: &[&str]) -> Session {
+    Session {
+        name: name.into(),
+        windows: windows
+            .iter()
+            .map(|w| Window {
+                name: (*w).into(),
+                manual_name: false,
+                layout: Node::Leaf(0),
+                active: 0,
+                zoomed: false,
+            })
+            .collect(),
         active: 0,
         cols: 40,
         rows: 24,
         sidebar: false,
         cwd: None,
         last_used: std::time::Instant::now(),
+    }
+}
+
+#[test]
+fn status_hit_is_computed_from_the_session_without_global_state() {
+    let sess = session_with("hit-s", &["a", "b"]);
+    let inp = StatusInput {
+        session: "hit-s".into(),
+        wins: sess.windows.iter().map(|w| win(&w.name)).collect(),
+        active: 0,
+        ellipsis: "…",
+        right: Right::None,
     };
-    let (a0, b0) = (layout.hits[0].1, layout.hits[0].2);
-    let (a1, _) = (layout.hits[1].1, layout.hits[1].2);
+    let hits = status_layout(&inp, 40).hits;
+    let (a0, b0) = (hits[0].1, hits[0].2);
+    let a1 = hits[1].1;
     assert_eq!(status_hit(&sess, a0), Some(0));
     assert_eq!(status_hit(&sess, b0), None, "gap column is not a window");
     assert_eq!(status_hit(&sess, a1), Some(1));
+    // same session name, different windows: the answer follows the input, nothing is cached.
+    // The one-window session's label covers column a1, so it answers 0 there.
+    let other = session_with("hit-s", &["only"]);
+    assert_eq!(status_hit(&other, a1), Some(0));
+    assert_eq!(status_hit(&other, a1 + 8), None);
+    assert_eq!(status_hit(&sess, a1), Some(1));
+}
+
+#[test]
+fn status_hit_without_windows_is_none() {
+    assert_eq!(status_hit(&session_with("empty", &[]), 0), None);
+}
+
+#[test]
+fn muted_hint_uses_bar_foreground_and_faint_attribute() {
+    let t = Theme::terminal();
+    let (fg, bg, attrs) = tone_style(&t, Tone::Muted);
+    assert_eq!(fg, t.c(t.bar_fg));
+    assert_eq!(bg, t.c(t.bar_bg));
+    assert_eq!(attrs & DIM, DIM);
+    assert_ne!(fg, Color::AnsiValue(8), "ANSI 8 on ANSI 0 can vanish");
+}
+
+#[test]
+fn mono_muted_text_is_faint_without_color() {
+    let t = Theme {
+        mono: true,
+        ..Theme::terminal()
+    };
+    let (fg, bg, attrs) = tone_style(&t, Tone::Muted);
+    assert_eq!((fg, bg), (Color::Reset, Color::Reset));
+    assert_eq!(attrs & DIM, DIM);
+}
+
+fn msg(text: &str, error: bool) -> Message {
+    Message {
+        text: text.into(),
+        at: std::time::Instant::now(),
+        error,
+    }
+}
+
+#[test]
+fn message_glyph_info_is_neutral_and_ok_is_for_copied_or_sourced() {
+    let g = |text, error| message_glyph(&msg(text, error), &UNICODE);
+    assert_eq!(
+        g("cancelled", false),
+        Glyph {
+            text: "•",
+            tone: Tone::Bar
+        }
+    );
+    assert_eq!(
+        g("copied 3 characters", false),
+        Glyph {
+            text: "✓",
+            tone: Tone::Ok
+        }
+    );
+    assert_eq!(
+        g("sourced ~/.tmuxlike.conf", false),
+        Glyph {
+            text: "✓",
+            tone: Tone::Ok
+        }
+    );
+    assert_eq!(
+        g("unknown command: x", true),
+        Glyph {
+            text: "✗",
+            tone: Tone::Err
+        }
+    );
+}
+
+#[test]
+fn message_glyph_follows_the_ascii_set_and_keeps_errors_on_error_token() {
+    let g = |text, error| message_glyph(&msg(text, error), &ASCII);
+    assert_eq!(g("cancelled", false).text, "*");
+    assert_eq!(g("copied", false).text, "+");
+    assert_eq!(
+        g("boom", true),
+        Glyph {
+            text: "x",
+            tone: Tone::Err
+        }
+    );
+}
+
+#[test]
+fn info_message_is_drawn_in_the_bar_color() {
+    let right = Right::Message {
+        glyph: Glyph {
+            text: "•",
+            tone: Tone::Bar,
+        },
+        text: "cancelled".into(),
+    };
+    let layout = status_layout(&input("demo", vec![win("cmd")], 0, right), 80);
+    let seg = layout
+        .segs
+        .iter()
+        .find(|s| s.text.contains("cancelled"))
+        .expect("message is drawn");
+    assert_eq!(seg.tone, Tone::Bar);
+    assert_eq!(seg.text, " • cancelled");
+}
+
+#[test]
+fn ascii_bar_cuts_with_the_theme_ellipsis_only() {
+    let mut inp = input("demo-with-a-long-session-name", twelve(), 5, key_bar("C-b"));
+    inp.ellipsis = "~";
+    for w in 8..=90u16 {
+        let (text, _) = row(&inp, w);
+        assert!(text.is_ascii(), "w={w} {text:?}");
+    }
+    let right = Right::Message {
+        glyph: Glyph {
+            text: "x",
+            tone: Tone::Err,
+        },
+        text: "a long error message that has to be cut somewhere".into(),
+    };
+    let mut err = input("demo", vec![win("cmd")], 0, right);
+    err.ellipsis = "~";
+    let (text, _) = row(&err, 40);
+    assert!(text.is_ascii() && text.contains('~'), "{text:?}");
+}
+
+#[test]
+fn which_key_bar_is_ascii_when_bindings_are_default() {
+    assert!(which_key(&defaults(), 80).is_ascii());
+    assert!(which_key(&defaults(), 40).is_ascii());
 }
 
 #[test]
@@ -254,9 +410,11 @@ fn copy_mode_shows_the_copy_chip_and_hints() {
 #[test]
 fn message_chip_is_right_aligned_and_cut() {
     let long = Right::Message {
-        glyph: "✗",
+        glyph: Glyph {
+            text: "✗",
+            tone: Tone::Err,
+        },
         text: "unknown command: a-very-long-error-message-that-keeps-going".into(),
-        error: true,
     };
     let (text, hits) = row(&input("demo", vec![win("cmd")], 0, long), 60);
     assert!(text.contains("✗ unknown"), "{text:?}");
@@ -269,13 +427,15 @@ fn message_chip_is_right_aligned_and_cut() {
 }
 
 #[test]
-fn info_message_uses_ok_glyph() {
-    let msg = Right::Message {
-        glyph: "✓",
+fn copied_message_uses_ok_glyph() {
+    let right = Right::Message {
+        glyph: Glyph {
+            text: "✓",
+            tone: Tone::Ok,
+        },
         text: "copied 42 chars".into(),
-        error: false,
     };
-    let (text, _) = row(&input("demo", vec![win("cmd")], 0, msg), 80);
+    let (text, _) = row(&input("demo", vec![win("cmd")], 0, right), 80);
     assert!(text.trim_end().ends_with("✓ copied 42 chars"), "{text:?}");
 }
 

@@ -1,37 +1,9 @@
 //! Pure text helpers for the status row: width-safe cuts, which-key line, prompt view.
 use super::{CONFIRM_SUFFIX, PREFIX_CHIP, WHICH_KEY_END, WHICH_KEY_GROUPS};
 use crate::commands::tokenize;
+use crate::render::cut;
 use std::collections::BTreeMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-/// Cut `s` to at most `max` columns, ending with `ell` when shortened.
-pub(super) fn cut(s: &str, max: u16, ell: &str) -> String {
-    let max = max as usize;
-    if s.width() <= max {
-        return s.to_string();
-    }
-    if max < ell.width() {
-        return String::new();
-    }
-    let mut out = clip(s, max - ell.width());
-    out.push_str(ell);
-    out
-}
-
-/// Clip `s` to at most `max` columns without an ellipsis (never splits a wide char).
-pub(super) fn clip(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if used + cw > max {
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
-    out
-}
 
 /// Keys that run command `cmd`: the single-char key first, then the shortest.
 pub(super) fn key_for<'a>(bindings: &'a BTreeMap<String, String>, cmd: &str) -> Option<&'a str> {
@@ -98,7 +70,7 @@ pub(super) fn which_key(bindings: &BTreeMap<String, String>, width: u16) -> Stri
     let pad = room.saturating_sub(line.width());
     line.push_str(&" ".repeat(pad));
     line.push_str(WHICH_KEY_END);
-    clip(&line, width)
+    cut(&line, width, "")
 }
 
 /// Prompt row text for `w` columns and the terminal cursor column. The input scrolls so the
@@ -141,5 +113,5 @@ pub(super) fn prompt_view(label: &str, buf: &str, cur: usize, w: u16, ell: &str)
 /// Confirm row text: the question (cut at the end) followed by the `(y/n)` suffix.
 pub(super) fn confirm_text(question: &str, w: u16, ell: &str) -> String {
     let room = w.saturating_sub(CONFIRM_SUFFIX.width() as u16);
-    format!("{}{CONFIRM_SUFFIX}", cut(question, room, ell))
+    format!("{}{CONFIRM_SUFFIX}", cut(question, usize::from(room), ell))
 }
