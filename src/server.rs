@@ -764,7 +764,11 @@ impl State {
                 c.session = o.clone();
                 c.frame.invalidate();
                 c.message = Some(Message {
-                    text: format!("session {session} ended — now in {o}"),
+                    text: commands::session_ended_text(
+                        &crate::theme::Theme::resolve(&self.cfg.theme, &c.env),
+                        session,
+                        o,
+                    ),
                     at: Instant::now(),
                     error: false,
                 });
@@ -970,7 +974,7 @@ impl State {
                 self.buffer = Some(text);
             }
             Cmd::KillSession { target: Some(t) } => {
-                let si = self.target_session(Some(t.as_str()))?;
+                let si = self.session_index_for_kill(&t)?;
                 self.kill_session(si);
             }
             Cmd::KillWindow { target: Some(t) } => {
@@ -1043,10 +1047,7 @@ impl State {
                 self.kill_window_at(s, w);
             }
             Cmd::KillSession { target } => {
-                let s = match target {
-                    None => si,
-                    Some(t) => self.target_session(Some(t.as_str()))?,
-                };
+                let s = self.kill_session_target(si, target.as_deref())?;
                 self.kill_session(s);
             }
             Cmd::NextAttention { backward } => self.next_attention(cid, si, backward),
@@ -1055,12 +1056,17 @@ impl State {
                     // confirm-close off: the command runs at once, as if typed
                     return self.exec(shared, cid, commands::parse(&command)?);
                 }
+                // the target is bound now: `y` later runs `pending`, and kill-pane also
+                // refuses when the active pane has moved (`expect_pane`)
+                let target = self.confirm_target(si, &command)?;
                 let text = match prompt {
                     Some(p) => p,
                     None => self.confirm_prompt_text(si, &command)?,
                 };
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    c.prompt = Some(Prompt::confirm(text, command));
+                    let mut p = Prompt::confirm(text, target.pending);
+                    p.expect_pane = target.expect_pane;
+                    c.prompt = Some(p);
                 }
             }
             Cmd::KillServer => {

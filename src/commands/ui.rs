@@ -5,7 +5,7 @@ use crate::api::{Status, pane_id_str};
 use crate::copy::CopyState;
 use crate::render::{Frame, render_client};
 use crate::server::{Client, Message, Prompt, PromptKind, State};
-use crate::theme::ClientEnv;
+use crate::theme::{ClientEnv, Theme};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -98,21 +98,33 @@ fn agent_note(st: &State, pid: usize) -> String {
         .unwrap_or_default()
 }
 
-/// `▲ claude 0.1 blocked: need approval`
-pub fn attention_text(st: &State, pid: usize, status: Status) -> String {
-    let glyph = if status == Status::Blocked {
-        "▲"
-    } else {
-        "◆"
-    };
-    let place = pane_place(st, pid)
-        .map(|(_, wi, pi)| format!(" {wi}.{pi}"))
+/// `▲ claude 0.1 blocked: need approval`, glyph and all, from the client's theme.
+pub fn attention_text(st: &State, pid: usize, status: Status, theme: &Theme) -> String {
+    let place = pane_place(st, pid).map(|(_, wi, pi)| (wi, pi));
+    attention_line(
+        theme,
+        status,
+        &pane_who(st, pid),
+        place,
+        &agent_note(st, pid),
+    )
+}
+
+/// Pure form of `attention_text`; `place` is (window, pane) and `note` the `: message` part.
+pub fn attention_line(
+    theme: &Theme,
+    status: Status,
+    who: &str,
+    place: Option<(usize, usize)>,
+    note: &str,
+) -> String {
+    let place = place
+        .map(|(wi, pi)| format!(" {wi}.{pi}"))
         .unwrap_or_default();
     format!(
-        "{glyph} {}{place} {}{}",
-        pane_who(st, pid),
-        status.as_str(),
-        agent_note(st, pid)
+        "{} {who}{place} {}{note}",
+        theme.status(status).0,
+        status.as_str()
     )
 }
 
@@ -142,12 +154,9 @@ pub fn notify_blocked(st: &mut State, pid: usize) {
     let Some((session, wi, pi)) = pane_place(st, pid) else {
         return;
     };
-    let text = format!(
-        "▲ {} blocked in {session} {wi}.{pi}{} ({} Tab)",
-        pane_who(st, pid),
-        agent_note(st, pid),
-        st.cfg.prefix_name()
-    );
+    let who = pane_who(st, pid);
+    let note = agent_note(st, pid);
+    let prefix = st.cfg.prefix_name();
     let cids: Vec<usize> = st
         .clients
         .iter()
@@ -155,8 +164,32 @@ pub fn notify_blocked(st: &mut State, pid: usize) {
         .map(|(id, _)| *id)
         .collect();
     for cid in cids {
-        st.message(cid, text.clone());
+        // each client gets its own glyph set (Unicode or ASCII)
+        let theme = st.client_theme(cid);
+        let text = blocked_toast(&theme, &who, &session, wi, pi, &note, &prefix);
+        st.message(cid, text);
     }
+}
+
+/// Blocked-pane toast: `▲ claude blocked in work 1.2: need approval (C-b Tab)`.
+pub fn blocked_toast(
+    theme: &Theme,
+    who: &str,
+    session: &str,
+    wi: usize,
+    pi: usize,
+    note: &str,
+    prefix: &str,
+) -> String {
+    format!(
+        "{} {who} blocked in {session} {wi}.{pi}{note} ({prefix} Tab)",
+        theme.g.blocked
+    )
+}
+
+/// Notice for a client moved off a session that ended.
+pub fn session_ended_text(theme: &Theme, session: &str, other: &str) -> String {
+    format!("session {session} ended {} now in {other}", theme.g.dash)
 }
 
 static ATTACHED: AtomicBool = AtomicBool::new(false);
@@ -170,7 +203,7 @@ pub fn first_attach() -> bool {
 /// stay visible for 8 s.
 pub fn attach_hint(st: &mut State, cid: usize) {
     let p = st.cfg.prefix_name();
-    let text = format!("{p} ? keys · {p} a agents · {p} Tab next alert");
+    let text = attach_hint_text(&st.client_theme(cid), &p);
     if let Some(c) = st.clients.get_mut(&cid) {
         c.message = Some(Message {
             text,
@@ -179,6 +212,12 @@ pub fn attach_hint(st: &mut State, cid: usize) {
         });
     }
     st.mark_dirty();
+}
+
+/// `C-b ? keys · C-b a agents · C-b Tab next alert`; the separator comes from the theme.
+pub fn attach_hint_text(theme: &Theme, prefix: &str) -> String {
+    let dot = theme.g.dot;
+    format!("{prefix} ? keys {dot} {prefix} a agents {dot} {prefix} Tab next alert")
 }
 
 fn chooser_index(st: &State, si: usize) -> usize {
@@ -278,10 +317,20 @@ impl State {
         let Some((nsi, _)) = self.locate(pid) else {
             return;
         };
-        self.switch_session(cid, nsi);
+        // a session switch is a full redraw: pay it only when the target is another session
+        if nsi != si {
+            self.switch_session(cid, nsi);
+        }
         self.focus_pane(pid);
-        let text = attention_text(self, pid, status);
+        let theme = self.client_theme(cid);
+        let text = attention_text(self, pid, status, &theme);
         self.message(cid, text);
+    }
+
+    /// Theme for one client's chrome and notices: `[theme]` resolved with that client's env.
+    pub(crate) fn client_theme(&self, cid: usize) -> Theme {
+        let env = self.clients.get(&cid).map(|c| c.env).unwrap_or_default();
+        Theme::resolve(&self.cfg.theme, &env)
     }
 
     /// `(session index, window index)` for `SESSION:IDX`, `SESSION` (its current window) or,
@@ -347,10 +396,7 @@ impl State {
                 )
             }
             Cmd::KillSession { target } => {
-                let s = match target {
-                    None => si,
-                    Some(t) => self.target_session(Some(t.as_str()))?,
-                };
+                let s = self.kill_session_target(si, target.as_deref())?;
                 let sess = &self.sessions[s];
                 let panes: Vec<usize> = sess.windows.iter().flat_map(|w| w.panes()).collect();
                 format!(
@@ -363,6 +409,82 @@ impl State {
             _ => format!("{command}?"),
         })
     }
+
+    /// What a `confirm-before` runs on `y`, resolved now so that focus moving before `y`
+    /// cannot retarget it: kill-window and kill-session name their target, kill-pane pins
+    /// the pane that was active when asked.
+    pub(crate) fn confirm_target(&self, si: usize, command: &str) -> Result<ConfirmTarget, String> {
+        Ok(match parse(command)? {
+            Cmd::KillPane => ConfirmTarget {
+                pending: kill_pane_command().into(),
+                expect_pane: Some(self.active_pane(si)),
+            },
+            Cmd::KillWindow { target } => {
+                let (s, w) = self.window_for(Some(si), target.as_deref())?;
+                ConfirmTarget {
+                    pending: kill_window_command(&self.sessions[s].name, w),
+                    expect_pane: None,
+                }
+            }
+            Cmd::KillSession { target } => {
+                let s = self.kill_session_target(si, target.as_deref())?;
+                ConfirmTarget {
+                    pending: kill_session_command(&self.sessions[s].name),
+                    expect_pane: None,
+                }
+            }
+            _ => ConfirmTarget {
+                pending: command.to_string(),
+                expect_pane: None,
+            },
+        })
+    }
+
+    /// Session for `kill-session`: the default session without a target, else the named one.
+    pub(crate) fn kill_session_target(
+        &self,
+        si: usize,
+        target: Option<&str>,
+    ) -> Result<usize, String> {
+        match target {
+            None => Ok(si),
+            Some(t) => self.session_index_for_kill(t),
+        }
+    }
+
+    /// Exact session name first. A name with '.' never falls back to a prefix: a stale
+    /// `kill-session -t a.b` must not kill session `a`.
+    pub(crate) fn session_index_for_kill(&self, name: &str) -> Result<usize, String> {
+        if let Some(si) = self.sidx(name) {
+            return Ok(si);
+        }
+        if name.contains('.') {
+            return Err(format!("can't find session: {name}"));
+        }
+        self.target_session(Some(name))
+    }
+}
+
+/// Resolved `confirm-before` target: the command run on `y` and the pane it must still find.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmTarget {
+    pub pending: String,
+    pub expect_pane: Option<usize>,
+}
+
+/// `kill-pane`: the pane check is `ConfirmTarget::expect_pane`, not the command.
+pub fn kill_pane_command() -> &'static str {
+    "kill-pane"
+}
+
+/// `kill-window -t SESSION:IDX`, quoted when the session name needs it.
+pub fn kill_window_command(session: &str, index: usize) -> String {
+    format!("kill-window -t {}", quote(&format!("{session}:{index}")))
+}
+
+/// `kill-session -t NAME`, quoted when the name needs it.
+pub fn kill_session_command(name: &str) -> String {
+    format!("kill-session -t {}", quote(name))
 }
 
 fn count(n: usize, unit: &str) -> String {

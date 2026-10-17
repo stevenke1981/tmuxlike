@@ -149,7 +149,10 @@ impl State {
         if si >= self.sessions.len() {
             return;
         }
-        self.switch_session(cid, si);
+        // same session: no switch, so the client is not redrawn in full
+        if self.client_si(cid) != Some(si) {
+            self.switch_session(cid, si);
+        }
         match (wi, pi) {
             (Some(w), None) => {
                 self.sessions[si].active = w;
@@ -204,16 +207,33 @@ impl State {
         self.mark_dirty();
     }
 
-    /// `Confirm`: `y` or `Y` runs the pending command; any other key cancels.
+    /// `Confirm`: `y` or `Y` runs the pending command; any other key cancels. A confirm bound
+    /// to a pane (`expect_pane`) refuses `y` when that pane is no longer the active one.
     fn confirm_key(&mut self, shared: &Shared, cid: usize, k: &KeyEvent) {
         let Some(p) = self.take_prompt(cid) else {
             return;
         };
         let yes = matches!(k.code, KeyCode::Char('y' | 'Y')) && plain_key(k);
+        let expect = p.expect_pane;
         match (yes, p.pending) {
+            (true, Some(_)) if !self.is_expected_pane(cid, expect) => {
+                self.error_message(cid, "target changed - not killed");
+            }
             (true, Some(cmd)) => self.run_reporting(shared, cid, &cmd),
             _ => self.message(cid, "cancelled"),
         }
+    }
+
+    /// `true` when the confirm has no pane bound, or the bound pane still exists and is the
+    /// active pane of the client's session.
+    fn is_expected_pane(&self, cid: usize, expect: Option<usize>) -> bool {
+        let Some(pid) = expect else {
+            return true;
+        };
+        let Some(si) = self.client_si(cid) else {
+            return false;
+        };
+        self.panes.contains_key(&pid) && self.active_pane(si) == pid
     }
 
     fn text_prompt_key(&mut self, shared: &Shared, cid: usize, kind: PromptKind, k: &KeyEvent) {
@@ -250,20 +270,25 @@ impl State {
         }
     }
 
-    /// Apply an editing key to the open text prompt. Up/Down walk the `:` history.
+    /// Apply an editing key to the open text prompt. Up/Down walk the `:` history; a text
+    /// change ends history browsing.
     fn edit_prompt(&mut self, cid: usize, kind: PromptKind, k: &KeyEvent) {
         let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) else {
             return;
         };
         if kind == PromptKind::Command && matches!(k.code, KeyCode::Up | KeyCode::Down) {
             let up = k.code == KeyCode::Up;
-            if let Some(text) = history_step(&self.history, &p.buf, up) {
+            if let Some((hist, text)) = history_step(&self.history, p.hist, up) {
+                p.hist = hist;
                 p.cur = text.chars().count();
                 p.buf = text;
             }
             return;
         }
         if let Some((buf, cur)) = line_edit(&p.buf, p.cur, k) {
+            if buf != p.buf {
+                p.hist = None;
+            }
             p.buf = buf;
             p.cur = cur;
         }
@@ -366,14 +391,25 @@ fn word_start(chars: &[char], cur: usize) -> usize {
     i
 }
 
-/// Up/Down in the `:` prompt over `history` (oldest first). The position is found from the
-/// buffer itself, so no extra state is kept. Returns the new text, or `None` for no change.
-fn history_step(history: &[String], buf: &str, up: bool) -> Option<String> {
-    match history.iter().rposition(|h| h.as_str() == buf) {
-        Some(j) if up => j.checked_sub(1).map(|p| history[p].clone()),
-        Some(j) => Some(history.get(j + 1).cloned().unwrap_or_default()),
-        None if up => history.last().cloned(),
-        None => None,
+/// Up/Down in the `:` prompt over `history` (oldest first). `hist` is the browsing position
+/// (`None` = a fresh line), so duplicate entries are walked one by one. Returns the new
+/// position and the text it shows, or `None` when nothing moves. Up from a fresh line goes to
+/// the newest entry; Down past the newest returns to an empty fresh line.
+fn history_step(
+    history: &[String],
+    hist: Option<usize>,
+    up: bool,
+) -> Option<(Option<usize>, String)> {
+    let newest = history.len().checked_sub(1)?;
+    match (hist, up) {
+        (None, true) => Some((Some(newest), history[newest].clone())),
+        (None, false) => None,
+        (Some(i), true) => {
+            let prev = i.min(newest).checked_sub(1)?;
+            Some((Some(prev), history[prev].clone()))
+        }
+        (Some(i), false) if i < newest => Some((Some(i + 1), history[i + 1].clone())),
+        (Some(_), false) => Some((None, String::new())),
     }
 }
 
@@ -477,27 +513,64 @@ mod tests {
         assert!(line_edit("abc", 1, &key(KeyCode::Char('x'), KeyModifiers::ALT)).is_none());
     }
 
-    #[test]
-    fn history_up_walks_newest_to_oldest_and_down_returns() {
-        let h: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(history_step(&h, "", true), Some("c".into()));
-        assert_eq!(history_step(&h, "c", true), Some("b".into()));
-        assert_eq!(history_step(&h, "a", true), None, "oldest stays");
-        assert_eq!(history_step(&h, "a", false), Some("b".into()));
-        assert_eq!(
-            history_step(&h, "c", false),
-            Some("".into()),
-            "past newest clears"
-        );
-        assert_eq!(history_step(&h, "", false), None);
+    fn hist_of(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn history_up_from_unknown_text_goes_to_newest() {
-        let h: Vec<String> = vec!["a".into(), "b".into()];
-        assert_eq!(history_step(&h, "typed", true), Some("b".into()));
-        assert_eq!(history_step(&h, "typed", false), None);
-        assert_eq!(history_step(&[], "", true), None);
+    fn history_up_walks_newest_to_oldest_and_stops_at_oldest() {
+        let h = hist_of(&["a", "b", "c"]);
+        assert_eq!(history_step(&h, None, true), Some((Some(2), "c".into())));
+        assert_eq!(history_step(&h, Some(2), true), Some((Some(1), "b".into())));
+        assert_eq!(history_step(&h, Some(1), true), Some((Some(0), "a".into())));
+        assert_eq!(history_step(&h, Some(0), true), None, "oldest stays");
+    }
+
+    #[test]
+    fn history_down_walks_back_and_past_newest_clears_the_line() {
+        let h = hist_of(&["a", "b", "c"]);
+        assert_eq!(
+            history_step(&h, Some(0), false),
+            Some((Some(1), "b".into()))
+        );
+        assert_eq!(
+            history_step(&h, Some(2), false),
+            Some((None, String::new())),
+            "past newest is a fresh empty line"
+        );
+        assert_eq!(
+            history_step(&h, None, false),
+            None,
+            "fresh line: Down does nothing"
+        );
+    }
+
+    #[test]
+    fn history_with_duplicates_walks_each_position() {
+        // [a, b, a]: the text "a" appears twice; the position, not the text, drives the walk
+        let h = hist_of(&["a", "b", "a"]);
+        assert_eq!(history_step(&h, None, true), Some((Some(2), "a".into())));
+        assert_eq!(history_step(&h, Some(2), true), Some((Some(1), "b".into())));
+        assert_eq!(history_step(&h, Some(1), true), Some((Some(0), "a".into())));
+        assert_eq!(
+            history_step(&h, Some(0), false),
+            Some((Some(1), "b".into()))
+        );
+        assert_eq!(
+            history_step(&h, Some(1), false),
+            Some((Some(2), "a".into()))
+        );
+        assert_eq!(
+            history_step(&h, Some(2), false),
+            Some((None, String::new()))
+        );
+    }
+
+    #[test]
+    fn history_on_empty_list_never_moves() {
+        assert_eq!(history_step(&[], None, true), None);
+        assert_eq!(history_step(&[], None, false), None);
+        assert_eq!(history_step(&[], Some(0), true), None);
     }
 
     #[test]

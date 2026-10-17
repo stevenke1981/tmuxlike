@@ -24,6 +24,13 @@ impl State {
             return;
         };
         let (h, w) = (p.rect.h, p.rect.w);
+        // a zero-sized pane has no cell to move to; keys then only close copy mode
+        if h == 0 || w == 0 {
+            p.copy = None;
+            p.parser.screen_mut().set_scrollback(0);
+            self.mark_dirty();
+            return;
+        }
         let mut off = p.parser.screen().scrollback();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let mut cs = p.copy.clone().unwrap();

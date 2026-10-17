@@ -6,7 +6,8 @@
 use crate::copy::{self, CopyState};
 use crate::layout::Rect;
 use crate::render::{
-    SidebarKind, chooser_entries, sidebar_rows, sidebar_text_width, status_hit, status_regions,
+    SidebarKind, pack_chooser, sidebar_rows, sidebar_text_width, status_hit, status_regions,
+    unpack_chooser, visible_entries,
 };
 use crate::server::State;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -58,6 +59,10 @@ impl State {
                 return None;
             }
         }
+        // The status row spans the sidebar columns too, so it is checked before the sidebar.
+        if self.sessions[si].rows.checked_sub(1) == Some(m.row) {
+            return self.click_status(cid, si, m.column);
+        }
         if self.click_sidebar(cid, si, m.column, m.row) {
             return None;
         }
@@ -67,10 +72,6 @@ impl State {
         }
         if let Some(pid) = self.title_at(si, m.column, m.row) {
             self.focus_pane(pid);
-            return None;
-        }
-        if m.row == self.sessions[si].rows - 1 {
-            return self.click_status(cid, si, m.column);
         }
         None
     }
@@ -184,6 +185,10 @@ impl State {
         else {
             return;
         };
+        // a zero-sized pane has no cell to clamp to (and clamp panics when min > max)
+        if r.w == 0 || r.h == 0 {
+            return;
+        }
         let Some(p) = self.panes.get_mut(&pid) else {
             return;
         };
@@ -231,31 +236,39 @@ impl State {
         None
     }
 
-    /// Move the chooser selection by one entry or scroll the key popup. `true` if an overlay
-    /// was open.
+    /// Move the chooser selection by one entry (within the rows its filter shows) or scroll
+    /// the key popup. `true` if an overlay was open.
     fn wheel_overlay(&mut self, cid: usize, up: bool) -> bool {
-        let entries = chooser_entries(self).len();
-        let Some(c) = self.clients.get_mut(&cid) else {
+        let Some(c) = self.clients.get(&cid) else {
             return false;
         };
-        if let Some(sel) = c.chooser {
-            c.chooser = Some(if up {
-                sel.saturating_sub(1)
-            } else {
-                (sel + 1).min(entries.saturating_sub(1))
-            });
-        } else if let Some((lines, off)) = &mut c.popup {
+        if let Some(raw) = c.chooser {
+            let (_, filter) = unpack_chooser(raw);
+            let last = visible_entries(self, filter).len().saturating_sub(1);
+            let next = wheel_chooser(raw, last, up);
+            self.set_chooser_value(cid, next);
+            return true;
+        }
+        if c.popup.is_none() {
+            return false;
+        }
+        if let Some((lines, off)) = self.clients.get_mut(&cid).and_then(|c| c.popup.as_mut()) {
             let max = lines.len().saturating_sub(1);
             *off = if up {
                 off.saturating_sub(WHEEL_LINES)
             } else {
                 (*off + WHEEL_LINES).min(max)
             };
-        } else {
-            return false;
         }
         self.mark_dirty();
         true
+    }
+
+    fn set_chooser_value(&mut self, cid: usize, raw: usize) {
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.chooser = Some(raw);
+        }
+        self.mark_dirty();
     }
 
     fn wheel_pane(&mut self, pid: usize, r: Rect, up: bool) {
@@ -280,7 +293,7 @@ impl State {
         if p.parser.screen().scrollback() > 0 {
             p.copy.get_or_insert(CopyState {
                 cx: 0,
-                cy: r.h - 1,
+                cy: r.h.saturating_sub(1),
                 anchor: None,
                 line: false,
             });
@@ -288,5 +301,68 @@ impl State {
             p.copy = None;
         }
         self.mark_dirty();
+    }
+}
+
+/// Selection after one wheel tick over rows `0..=last`: up stops at the first row, down at
+/// the last. A stale selection past `last` is pulled back first.
+fn wheel_step(sel: usize, last: usize, up: bool) -> usize {
+    let sel = sel.min(last);
+    if up {
+        sel.saturating_sub(1)
+    } else {
+        (sel + 1).min(last)
+    }
+}
+
+/// Chooser value (`pack_chooser` form) after one wheel tick: the filter is kept, the selection
+/// steps within the `last + 1` rows that filter shows.
+fn wheel_chooser(raw: usize, last: usize, up: bool) -> usize {
+    let (sel, filter) = unpack_chooser(raw);
+    pack_chooser(wheel_step(sel, last, up), filter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Status;
+    use crate::render::Filter;
+
+    #[test]
+    fn wheel_step_moves_one_row_and_clamps_at_both_ends() {
+        assert_eq!(wheel_step(0, 4, true), 0, "wheel up at the top stays at 0");
+        assert_eq!(wheel_step(2, 4, true), 1);
+        assert_eq!(wheel_step(2, 4, false), 3);
+        assert_eq!(wheel_step(4, 4, false), 4, "wheel down at the end stays");
+    }
+
+    #[test]
+    fn wheel_step_on_empty_or_stale_selection_stays_in_range() {
+        assert_eq!(wheel_step(0, 0, false), 0);
+        assert_eq!(
+            wheel_step(9, 2, true),
+            1,
+            "stale selection is clamped first"
+        );
+        assert_eq!(wheel_step(9, 2, false), 2);
+    }
+
+    #[test]
+    fn wheel_chooser_keeps_the_filter_while_stepping() {
+        let blocked = Filter::Only(Status::Blocked);
+        let raw = pack_chooser(1, blocked);
+        let down = wheel_chooser(raw, 3, false);
+        assert_eq!(unpack_chooser(down), (2, blocked));
+        let up = wheel_chooser(down, 3, true);
+        assert_eq!(unpack_chooser(up), (1, blocked));
+    }
+
+    #[test]
+    fn wheel_chooser_at_top_with_all_filter_stays_at_zero() {
+        let raw = pack_chooser(0, Filter::All);
+        assert_eq!(
+            unpack_chooser(wheel_chooser(raw, 5, true)),
+            (0, Filter::All)
+        );
     }
 }

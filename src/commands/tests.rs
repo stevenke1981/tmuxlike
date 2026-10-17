@@ -1,6 +1,19 @@
 use super::*;
 use crate::api::Status;
+use crate::theme::{ClientEnv, Theme, ThemeCfg};
 use unicode_width::UnicodeWidthStr;
+
+fn ascii_theme() -> Theme {
+    let cfg = ThemeCfg {
+        ascii_glyphs: "true".into(),
+        ..ThemeCfg::default()
+    };
+    Theme::resolve(&cfg, &ClientEnv::default())
+}
+
+fn unicode_theme() -> Theme {
+    Theme::resolve(&ThemeCfg::default(), &ClientEnv::default())
+}
 
 #[test]
 fn tokenize_quotes() {
@@ -252,6 +265,106 @@ fn attention_and_confirm_bindings_are_defaults() {
     assert!(has("g", "choose-tree"));
     assert!(has("x", "confirm-before kill-pane"));
     assert!(has("&", "confirm-before kill-window"));
+}
+
+#[test]
+fn kill_window_pending_names_session_and_index() {
+    assert_eq!(kill_window_command("demo", 2), "kill-window -t demo:2");
+    // the quoted form must parse back to the same window target
+    assert_eq!(
+        parse(&kill_window_command("my work", 0)).unwrap(),
+        Cmd::KillWindow {
+            target: Some("my work:0".into())
+        }
+    );
+}
+
+#[test]
+fn kill_session_pending_names_the_session() {
+    assert_eq!(kill_session_command("work"), "kill-session -t work");
+    assert_eq!(
+        kill_session_command("my work"),
+        "kill-session -t \"my work\""
+    );
+    assert_eq!(
+        parse(&kill_session_command("my work")).unwrap(),
+        Cmd::KillSession {
+            target: Some("my work".into())
+        }
+    );
+}
+
+#[test]
+fn kill_pane_pending_is_the_bare_command() {
+    // the pane pin travels in ConfirmTarget::expect_pane, not in the command text
+    assert_eq!(kill_pane_command(), "kill-pane");
+    assert_eq!(parse(kill_pane_command()).unwrap(), Cmd::KillPane);
+}
+
+#[test]
+fn attention_line_uses_theme_glyphs() {
+    let place = Some((0, 1));
+    let uni = attention_line(
+        &unicode_theme(),
+        Status::Blocked,
+        "claude",
+        place,
+        ": need approval",
+    );
+    assert_eq!(uni, "▲ claude 0.1 blocked: need approval");
+    let done = attention_line(&unicode_theme(), Status::Done, "codex", None, "");
+    assert_eq!(done, "◆ codex done");
+}
+
+#[test]
+fn attention_line_is_ascii_under_ascii_theme() {
+    let line = attention_line(
+        &ascii_theme(),
+        Status::Blocked,
+        "claude",
+        Some((0, 1)),
+        ": need approval",
+    );
+    assert_eq!(line, "! claude 0.1 blocked: need approval");
+    assert!(line.is_ascii(), "{line:?}");
+    let done = attention_line(&ascii_theme(), Status::Done, "codex", None, "");
+    assert!(done.is_ascii(), "{done:?}");
+}
+
+#[test]
+fn blocked_toast_is_ascii_under_ascii_theme() {
+    let toast = blocked_toast(
+        &ascii_theme(),
+        "claude",
+        "work",
+        1,
+        2,
+        ": need approval",
+        "C-b",
+    );
+    assert_eq!(
+        toast,
+        "! claude blocked in work 1.2: need approval (C-b Tab)"
+    );
+    assert!(toast.is_ascii(), "{toast:?}");
+    let uni = blocked_toast(&unicode_theme(), "claude", "work", 1, 2, "", "C-b");
+    assert!(uni.starts_with("▲ claude blocked"), "{uni:?}");
+}
+
+#[test]
+fn attach_hint_separator_follows_theme() {
+    let ascii = attach_hint_text(&ascii_theme(), "C-b");
+    assert_eq!(ascii, "C-b ? keys . C-b a agents . C-b Tab next alert");
+    assert!(ascii.is_ascii(), "{ascii:?}");
+    assert!(attach_hint_text(&unicode_theme(), "C-b").contains(" · "));
+}
+
+#[test]
+fn session_ended_notice_dash_follows_theme() {
+    let ascii = session_ended_text(&ascii_theme(), "work", "main");
+    assert_eq!(ascii, "session work ended - now in main");
+    assert!(ascii.is_ascii(), "{ascii:?}");
+    assert!(session_ended_text(&unicode_theme(), "work", "main").contains('—'));
 }
 
 #[test]

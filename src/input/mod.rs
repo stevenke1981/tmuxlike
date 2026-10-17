@@ -5,7 +5,7 @@ mod keys;
 mod mouse;
 
 use crate::commands;
-use crate::server::{Shared, State};
+use crate::server::{PromptKind, Shared, State};
 use crossterm::event::{Event, KeyEventKind};
 use std::time::Instant;
 
@@ -14,6 +14,23 @@ impl State {
         if let Err(e) = commands::parse(line).and_then(|c| self.exec(shared, cid, c)) {
             self.message(cid, e);
         }
+    }
+
+    /// Insert pasted text at the prompt cursor, like typing; line breaks become spaces.
+    fn paste_prompt(&mut self, cid: usize, text: &str) {
+        let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) else {
+            return;
+        };
+        let text = text.replace(['\r', '\n'], " ");
+        let at = p
+            .buf
+            .char_indices()
+            .nth(p.cur)
+            .map_or(p.buf.len(), |(i, _)| i);
+        p.buf.insert_str(at, &text);
+        p.cur += text.chars().count();
+        p.hist = None;
+        self.mark_dirty();
     }
 
     pub(crate) fn handle_event(&mut self, shared: &Shared, cid: usize, ev: Event) {
@@ -32,23 +49,15 @@ impl State {
                 }
             }
             Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(shared, cid, si, k),
-            Event::Paste(text) => {
-                if let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    // insert at the cursor, like typing
-                    let text = text.replace(['\r', '\n'], " ");
-                    let at = p
-                        .buf
-                        .char_indices()
-                        .nth(p.cur)
-                        .map_or(p.buf.len(), |(i, _)| i);
-                    p.buf.insert_str(at, &text);
-                    p.cur += text.chars().count();
-                    self.mark_dirty();
-                    return;
+            Event::Paste(text) => match self.clients.get(&cid).and_then(|c| c.prompt.as_ref()) {
+                // a y/n question takes no text: the paste is dropped
+                Some(p) if p.kind == PromptKind::Confirm => {}
+                Some(_) => self.paste_prompt(cid, &text),
+                None => {
+                    let pid = self.active_pane(si);
+                    self.paste(pid, &text);
                 }
-                let pid = self.active_pane(si);
-                self.paste(pid, &text);
-            }
+            },
             Event::Mouse(m) if self.cfg.mouse => {
                 if let Some(line) = self.handle_mouse(cid, si, m) {
                     self.run_line(shared, cid, &line);

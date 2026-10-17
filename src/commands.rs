@@ -355,7 +355,7 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "previous-window" | "prev" => Cmd::PrevWindow,
         "select-window" | "selectw" => {
             let t = flag_val(args, "-t")
-                .or_else(|| rest())
+                .or_else(rest)
                 .ok_or("select-window: need -t N")?;
             Cmd::SelectWindow(
                 t.trim_start_matches(':')
@@ -439,49 +439,50 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
 
 /// Bytes for one `send-keys` argument: a key name (Enter, C-c, Up, ...) or literal text.
 pub fn send_key_bytes(arg: &str, literal: bool) -> Vec<u8> {
-    if !literal && arg.chars().count() > 1 {
-        if let Ok(n) = normalize_key(arg) {
-            let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
-            loop {
-                if let Some(r) = rest.strip_prefix("C-") {
-                    mods |= KeyModifiers::CONTROL;
-                    rest = r;
-                } else if let Some(r) = rest.strip_prefix("M-") {
-                    mods |= KeyModifiers::ALT;
-                    rest = r;
-                } else if let Some(r) = rest.strip_prefix("S-") {
-                    mods |= KeyModifiers::SHIFT;
-                    rest = r;
-                } else {
-                    break;
-                }
+    if !literal
+        && arg.chars().count() > 1
+        && let Ok(n) = normalize_key(arg)
+    {
+        let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
+        loop {
+            if let Some(r) = rest.strip_prefix("C-") {
+                mods |= KeyModifiers::CONTROL;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("M-") {
+                mods |= KeyModifiers::ALT;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("S-") {
+                mods |= KeyModifiers::SHIFT;
+                rest = r;
+            } else {
+                break;
             }
-            let code = match rest {
-                "Space" => Some(KeyCode::Char(' ')),
-                "Enter" => Some(KeyCode::Enter),
-                "Tab" => Some(KeyCode::Tab),
-                "BTab" => Some(KeyCode::BackTab),
-                "Escape" => Some(KeyCode::Esc),
-                "BSpace" => Some(KeyCode::Backspace),
-                "Up" => Some(KeyCode::Up),
-                "Down" => Some(KeyCode::Down),
-                "Left" => Some(KeyCode::Left),
-                "Right" => Some(KeyCode::Right),
-                "Home" => Some(KeyCode::Home),
-                "End" => Some(KeyCode::End),
-                "PageUp" => Some(KeyCode::PageUp),
-                "PageDown" => Some(KeyCode::PageDown),
-                "Insert" => Some(KeyCode::Insert),
-                "Delete" => Some(KeyCode::Delete),
-                f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
-                    Some(KeyCode::F(f[1..].parse().unwrap()))
-                }
-                c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
-                _ => None,
-            };
-            if let Some(code) = code {
-                return crate::keys::encode(&KeyEvent::new(code, mods), false);
+        }
+        let code = match rest {
+            "Space" => Some(KeyCode::Char(' ')),
+            "Enter" => Some(KeyCode::Enter),
+            "Tab" => Some(KeyCode::Tab),
+            "BTab" => Some(KeyCode::BackTab),
+            "Escape" => Some(KeyCode::Esc),
+            "BSpace" => Some(KeyCode::Backspace),
+            "Up" => Some(KeyCode::Up),
+            "Down" => Some(KeyCode::Down),
+            "Left" => Some(KeyCode::Left),
+            "Right" => Some(KeyCode::Right),
+            "Home" => Some(KeyCode::Home),
+            "End" => Some(KeyCode::End),
+            "PageUp" => Some(KeyCode::PageUp),
+            "PageDown" => Some(KeyCode::PageDown),
+            "Insert" => Some(KeyCode::Insert),
+            "Delete" => Some(KeyCode::Delete),
+            f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
+                Some(KeyCode::F(f[1..].parse().unwrap()))
             }
+            c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return crate::keys::encode(&KeyEvent::new(code, mods), false);
         }
     }
     arg.as_bytes().to_vec()
