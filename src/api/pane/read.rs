@@ -5,6 +5,11 @@
 use crate::api::{ApiError, Pattern, ReadSource, lock};
 use crate::server::{Shared, State};
 use regex::Regex;
+use unicode_width::UnicodeWidthStr;
+
+/// ConPTY emits CRLF at full rows, so on Windows a full-width row is assumed to continue.
+/// (An exact-width line followed by a new line is then joined too: a match superset.)
+const HARD_WRAP_AT_WIDTH: bool = cfg!(windows);
 
 /// Rows returned by `Recent` when no count is given.
 const RECENT_ROWS: usize = 80;
@@ -96,9 +101,16 @@ fn view_rows(screen: &vt100::Screen, skip: usize, take: usize) -> Vec<Row> {
         .enumerate()
         .skip(skip)
         .take(take)
-        .map(|(i, text)| Row {
-            text,
-            wrapped: u16::try_from(i).is_ok_and(|r| screen.row_wrapped(r)),
+        .map(|(i, text)| {
+            // ConPTY (Windows) emits an explicit CRLF at a full row instead of a soft wrap, so
+            // vt100 never flags it; treat a row filled to the pane width as continuing too.
+            let full =
+                HARD_WRAP_AT_WIDTH && UnicodeWidthStr::width(text.as_str()) >= usize::from(width);
+            let soft = u16::try_from(i).is_ok_and(|r| screen.row_wrapped(r));
+            Row {
+                wrapped: soft || full,
+                text,
+            }
         })
         .collect()
 }
@@ -253,11 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_width_line_is_not_joined_with_the_next() {
+    fn exact_width_line_joins_only_on_conpty() {
         let mut parser = vt100::Parser::new(3, 10, 100);
         parser.process(b"abcdefghij\r\nk\r\n");
         let lines = logical_lines(&window(text_rows(&parser), None));
-        assert_eq!(lines, vec!["abcdefghij".to_string(), "k".to_string()]);
+        if HARD_WRAP_AT_WIDTH {
+            assert_eq!(lines, vec!["abcdefghijk".to_string()]);
+        } else {
+            assert_eq!(lines, vec!["abcdefghij".to_string(), "k".to_string()]);
+        }
     }
 
     #[test]
