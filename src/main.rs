@@ -16,6 +16,7 @@ mod client;
 mod commands;
 mod config;
 mod copy;
+mod i18n;
 mod input;
 mod ipc;
 mod keys;

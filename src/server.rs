@@ -698,6 +698,12 @@ impl State {
         }
     }
 
+    /// UI language for client `cid` (config `lang` + its locale); English when unknown.
+    pub(crate) fn client_lang(&self, cid: usize) -> crate::i18n::Lang {
+        let env = self.clients.get(&cid).and_then(|c| c.env.lang);
+        crate::i18n::Lang::resolve(&self.cfg.lang, env)
+    }
+
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
         let _ = self.notify.send(());
