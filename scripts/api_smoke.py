@@ -4,7 +4,9 @@
 Each step prints "ok <step>". Covers session/pane listing, split with and without
 focus, wait-output, text input with special characters, send-keys validation,
 agent report/wait/prompt/rename/release, error exit codes, zoom/rename/close and
-layout persistence across `server stop` and a fresh start.
+layout persistence across `server stop` and a fresh start. Regression steps cover
+pane-id-shaped agent names, `--help` exit 0, wrapped wait-output, and the no-server
+JSON error plus clearing the saved layout when the last session closes.
 Works on Windows (ConPTY) and Linux/macOS (PTY); stdlib only.
 Usage: python scripts/api_smoke.py [path-to-tmuxlike]
 """
@@ -30,6 +32,7 @@ AGENT_SOURCE = "api-smoke"
 AGENT_KIND = "fake-agent"
 CALL_TIMEOUT = 60  # seconds per CLI call; ConPTY is slow
 POLL_TIMEOUT = 60  # seconds per poll()
+WRAP_FILL = "A" * 110  # makes START + WRAP_FILL + END wider than a narrow pane
 
 WORK = tempfile.mkdtemp(prefix="tmuxlike-api-")
 LOG = os.path.join(WORK, "server.log")
@@ -388,15 +391,99 @@ def step_persistence(p1):
     ok("kill-server-removes-state")
 
 
+def step_agent_rename_rejects_pane_id(p1):
+    if report(p1, "idle", 10) is not True:
+        fail("report idle seq 10 was not applied before the pane-id name check")
+    # rejected either by the CLI (usage error, exit 2) or by the server (invalid_argument)
+    r = run(["agent", "rename", p1, "p1"])
+    if r.returncode == 2:
+        pass
+    elif r.returncode == 1 and "invalid_argument" in r.stderr:
+        pass
+    else:
+        fail(f"agent rename to a pane-id-shaped name was not rejected, {describe(r)}")
+    ok("agent-rename-rejects-pane-id")
+    expect_ok(["pane", "release-agent", p1, "--source", AGENT_SOURCE, "--agent", AGENT_KIND],
+              "release-agent after pane-id name check")
+
+
+def step_help():
+    r = run(["pane", "--help"])
+    if r.returncode != 0:
+        fail(f"pane --help should exit 0, {describe(r)}")
+    if "pane list" not in r.stdout:
+        fail(f"pane --help does not print the help text on stdout: {r.stdout[:500]!r}")
+    ok("help-exit-0")
+
+
+def step_wait_output_wrapped(p1):
+    narrow = expect_json(["pane", "split", p1, "--direction", "right", "--ratio", "0.2", "--no-focus"],
+                         "split narrow pane")["pane"]
+    pid = check_pane_id(narrow.get("pane_id"), "split narrow pane")
+    # A 30-column pane can break the prompt across rows, so join the visible rows before matching.
+    poll(lambda: pane_read(pid).replace("\n", ""), lambda t: re.search(PROMPT_RE, t) is not None,
+         "shell prompt in narrow pane", timeout=60)
+    # sh and PowerShell both drop the empty "" pieces, so the typed command never shows the joined marker.
+    expect_ok(["pane", "run", pid, 'echo STAR""T' + WRAP_FILL + 'EN""D'], "pane run wrapped echo")
+    res = expect_json(["pane", "wait-output", pid, "--regex", "START[A]+END", "--timeout", "60000"],
+                      "wait-output wrapped marker", timeout=90)
+    require_matched(res, "wrapped START...END marker")
+    line = res.get("line")
+    if not isinstance(line, str) or WRAP_FILL not in line:
+        fail(f"wait-output did not return the joined logical line: {res!r}")
+    ok("wait-output-wrapped")
+    expect_json(["pane", "close", pid], "close narrow pane")
+
+
+def no_server_error(r):
+    """The error object of a `server_not_running` reply (exit 1, JSON on stderr), else None."""
+    if r.returncode != 1 or r.stdout.strip():
+        return None
+    try:
+        err = json.loads(r.stderr)["error"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if isinstance(err, dict) and err.get("code") == "server_not_running":
+        return err
+    return None
+
+
+def step_close_last_session():
+    expect_ok(["new", "-d", "-s", "last"], "new -d -s last (fresh server)")
+    poll(lambda: os.path.exists(STATE), lambda exists: exists,
+         "state file written for session last", timeout=10)
+    panes = poll(lambda: pane_list("last"), lambda ps: len(ps) == 1,
+                 "one pane in session last", timeout=10)
+    pid = check_pane_id(panes[0].get("pane_id"), "session last")
+    closed = expect_json(["pane", "close", pid], "pane close of the last session's only pane")
+    if closed.get("closed") != pid:
+        fail(f"pane close did not report closed: {closed!r}")
+    reply, _ = poll(lambda: (run(["pane", "list"]), os.path.exists(STATE)),
+                    lambda v: no_server_error(v[0]) is not None and not v[1],
+                    "server exit and state file removal after the last session closed", timeout=10)
+    err = no_server_error(reply)
+    if not isinstance(err.get("message"), str):
+        fail(f"server_not_running error has no message: {err!r}")
+    ok("no-server-json-error")
+    time.sleep(1.0)
+    if os.path.exists(STATE):
+        fail("state file reappeared after the last session closed")
+    ok("close-last-session-clears-state")
+
+
 def scenario():
     p1 = step_create_session()
     p2, p3 = step_split(p1)
     step_commands(p1)
     step_keys(p1)
     step_agents(p1)
+    step_agent_rename_rejects_pane_id(p1)
     step_errors(p1)
+    step_help()
     step_pane_ops(p2, p3)
+    step_wait_output_wrapped(p1)
     step_persistence(p1)
+    step_close_last_session()
 
 
 def cleanup(failed):
