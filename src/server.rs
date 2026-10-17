@@ -161,6 +161,8 @@ pub struct Client {
     pub message: Option<(String, Instant)>,
     /// mouse drag start: (pane, abs row, col), and whether we moved
     pub drag: Option<(usize, i64, u16, bool)>,
+    /// terminal capabilities reported at attach (theme resolution)
+    pub env: crate::theme::ClientEnv,
 }
 
 pub struct State {
@@ -1512,6 +1514,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                         popup: None,
                         message: None,
                         drag: None,
+                        env: crate::theme::ClientEnv::default(),
                     };
                     Ok(render_client(&st, &mut c).unwrap_or_default())
                 }
@@ -1530,6 +1533,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             rows,
             cwd,
             detached,
+            env,
         } => {
             let mut st = crate::api::lock(&shared);
             let name = match session {
@@ -1574,6 +1578,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                     popup: None,
                     message: None,
                     drag: None,
+                    env,
                 },
             );
             st.mark_dirty();

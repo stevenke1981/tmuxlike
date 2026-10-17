@@ -101,6 +101,7 @@ pub fn new_detached(session: Option<String>) -> Result<()> {
             rows,
             cwd,
             detached: true,
+            env: crate::theme::ClientEnv::detect(),
         }),
     )?;
     match read_msg::<ServerMsg>(&mut r)? {
@@ -134,6 +135,7 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
             rows,
             cwd,
             detached: false,
+            env: crate::theme::ClientEnv::detect(),
         }),
     )?;
 

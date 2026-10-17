@@ -23,6 +23,7 @@ mod persist;
 mod proto;
 mod render;
 mod server;
+mod theme;
 
 use proto::Command;
 

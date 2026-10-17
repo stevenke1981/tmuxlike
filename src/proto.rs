@@ -13,6 +13,9 @@ pub enum Command {
         /// create the session without attaching (new -d)
         #[serde(default)]
         detached: bool,
+        /// client terminal capabilities (NO_COLOR, TERM=dumb, ASCII)
+        #[serde(default)]
+        env: crate::theme::ClientEnv,
     },
     List,
     Kill {
