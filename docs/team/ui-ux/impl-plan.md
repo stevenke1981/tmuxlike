@@ -29,3 +29,19 @@ Coordinator-owned shared state (added before dispatch): `PromptKind::Confirm`, `
 Each item's acceptance criteria are in the source specs (`debug-frame --text` flags from UX-00 are the test hooks).
 Gate for the wave: cargo fmt/clippy clean for new code, cargo test, scripts/smoke.py, scripts/api_smoke.py, golden
 frame review (frames are expected to change; coordinator reviews the 5 scenarios + NO_COLOR + ASCII variants).
+
+## Worker rules (UI-1)
+- Base commit `dc79cbf`. Worktree `D:/tmuxlike-wt/uN`, branch `ui/uN`. Hard rules of `docs/team/herdr-alignment/brief.md` apply
+  (own files only, no git writes, no new deps, no server start without a unique TMUXLIKE_SOCKET/TMUXLIKE_STATE/TMUXLIKE_CONFIG; always kill-server).
+- Shared state (read-only for you): `crate::theme::{Theme, Glyphs}` (`cx.theme` in every render section; use `cx.theme.c(color)` for
+  every chrome color so mono works; `cx.theme.status(Status)` for glyph/color/word); `server::{Prompt, PromptKind::Confirm, Message}`,
+  `State.history`, config `hints`, `confirm_close`, `pane_titles`, `theme`.
+- Use `unicode-width` for every width; cut with `…` (`cx.theme.g.ellipsis`); never split a wide char.
+- Pure layout logic goes in pure functions with unit tests (e.g. `status_layout`, `which_key`, `sidebar_rows`, `edge_segments`).
+- Verify: `cargo fmt`, `cargo build` (no warnings from your files), `cargo test`, `cargo clippy --all-targets` (clean in your files),
+  `cargo build --release` + `python -I <scratchpad>/frame_golden.py <your exe> <scratchpad>/golden-uN` and READ the frames you changed
+  (strip ANSI) to check them against the spec mockups; `scripts/smoke.py` and `scripts/api_smoke.py` must still pass.
+  Scratchpad: C:/Users/eda/AppData/Local/Temp/claude/D--agent-team-workflow/5fe1fd1b-0a35-48d8-bbad-ffd9097c1ead/scratchpad
+- e2e strings that must survive (scripts/e2e_linux.py): `(rename-window)`, `unknown command`, `sourced`, `choose session`,
+  `work: 2 windows`, `detached`, sidebar words `idle`/`working`, `new-window` in help.
+- Report (≤ 40 lines): STATUS, files+line counts, item IDs done/partial/skipped, commands+exit codes, frame excerpts as evidence, gaps.
