@@ -257,6 +257,40 @@ pub enum Reply {
 
 pub type ApiResult = Result<Reply, ApiError>;
 
+/// Poll period for every wait; the server lock is never held while sleeping.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Max chars for labels, agent labels, messages and other display text.
+pub const LABEL_MAX: usize = 80;
+
+/// Lock the server state; a poisoned lock is recovered so socket input never panics a handler.
+pub fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Trim, drop control characters and cap at `max` chars. Empty result -> None.
+pub fn clean_text(s: &str, max: usize) -> Option<String> {
+    let t: String = s
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max)
+        .collect();
+    let t = t.trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Valid live agent name: `[a-z][a-z0-9_-]{0,31}` and not shaped like a pane id (`p12`),
+/// so a name can never shadow a pane target.
+pub fn is_agent_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    let first_ok = cs.next().is_some_and(|c| c.is_ascii_lowercase());
+    first_ok
+        && s.len() <= 32
+        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && parse_pane_id(s).is_none()
+}
+
 /// `p12` -> 12. Also accepts tmux-style `%12`. Rejects 0, leading zeros, signs and junk.
 pub fn parse_pane_id(s: &str) -> Option<usize> {
     let digits = s.strip_prefix('p').or_else(|| s.strip_prefix('%'))?;
@@ -309,8 +343,10 @@ pub fn handle(shared: &Shared, req: Request) -> ApiResult {
         Request::ServerStop => {
             // keep persisted state so the next server start restores the layout;
             // the connection handler exits the process after sending this reply
-            let st = shared.lock().unwrap_or_else(|e| e.into_inner());
-            crate::persist::save_now(&st);
+            let st = lock(shared);
+            if st.cfg.persist {
+                crate::persist::save_now(&st);
+            }
             Ok(Reply::Json(json!({ "stopped": true })))
         }
         Request::PaneReportAgent { .. }
@@ -338,5 +374,20 @@ mod tests {
             assert_eq!(parse_pane_id(bad), None, "{bad}");
         }
         assert_eq!(pane_id_str(3), "p3");
+    }
+    #[test]
+    fn agent_names() {
+        for ok in ["a", "reviewer", "claude-2", "x_y", "pa", "p1x"] {
+            assert!(is_agent_name(ok), "{ok}");
+        }
+        for bad in ["", "P1", "1a", "p1", "p42", "a b", "a.b", &"a".repeat(33)] {
+            assert!(!is_agent_name(bad), "{bad}");
+        }
+    }
+    #[test]
+    fn clean_text_strips_controls() {
+        assert_eq!(clean_text("  a\u{1b}b\n ", 80).as_deref(), Some("ab"));
+        assert_eq!(clean_text(" \t ", 80), None);
+        assert_eq!(clean_text("中文字", 2).as_deref(), Some("中文"));
     }
 }

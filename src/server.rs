@@ -26,6 +26,8 @@ pub struct Pane {
     pub rect: Rect,
     pub last_output: Instant,
     pub attention: bool,
+    /// when the pane was spawned; startup output does not count as unseen work
+    pub started: Instant,
     pub copy: Option<CopyState>,
     /// reported agent state (herdr-style `pane report-agent`)
     pub agent: Option<crate::api::AgentInfo>,
@@ -139,6 +141,9 @@ pub struct State {
     notify: mpsc::Sender<()>,
 }
 
+/// Output within this time after spawn (shell banner, prompt) is not "unseen work".
+const ATTENTION_GRACE: Duration = Duration::from_secs(2);
+
 pub type Shared = Arc<Mutex<State>>;
 
 impl State {
@@ -250,6 +255,7 @@ impl State {
             },
             last_output: Instant::now(),
             attention: false,
+            started: Instant::now(),
             copy: None,
             agent: None,
             label: None,
@@ -297,7 +303,9 @@ impl State {
                             let _ = p.writer.flush();
                         }
                         p.last_output = Instant::now();
-                        p.attention = true;
+                        if p.started.elapsed() >= ATTENTION_GRACE {
+                            p.attention = true;
+                        }
                         st.dirty = true;
                         let _ = st.notify.send(());
                     }
@@ -713,6 +721,9 @@ impl State {
         match cmd {
             Cmd::Set(k, v) => {
                 self.cfg.set(&k, &v)?;
+                if k == "persist" && !self.cfg.persist {
+                    crate::persist::clear();
+                }
                 if k == "sidebar" {
                     let sb = self.cfg.sidebar;
                     for s in &mut self.sessions {
@@ -1638,6 +1649,10 @@ pub fn run() -> Result<()> {
             if !st.sessions.is_empty() {
                 ever_had_session = true;
             } else if ever_had_session {
+                // every session was closed by the user: nothing to restore next time
+                if st.cfg.persist {
+                    crate::persist::clear();
+                }
                 std::process::exit(0);
             }
             if !st.dirty && !tick {

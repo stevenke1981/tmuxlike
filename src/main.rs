@@ -85,6 +85,10 @@ fn main() {
                     Ok(code) => std::process::exit(code),
                     Err(e) => Err(e),
                 },
+                Err(help) if help == api::cli::HELP => {
+                    println!("{help}");
+                    Ok(())
+                }
                 Err(usage) => {
                     eprintln!("tmuxlike: {usage}");
                     std::process::exit(2);
