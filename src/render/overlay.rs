@@ -403,12 +403,6 @@ pub struct KillTarget {
     pub command: String,
 }
 
-/// Kill target for a session or window row, in the server's default language. Pane rows have
-/// none (pane kill is `C-b x`). Clients in another language use [`kill_target_lang`].
-pub fn kill_target(st: &State, e: Entry) -> Option<KillTarget> {
-    kill_target_lang(st, e, Lang::resolve(&st.cfg.lang, None))
-}
-
 /// [`kill_target`] with the question written in `lang`.
 pub fn kill_target_lang(st: &State, e: Entry, lang: Lang) -> Option<KillTarget> {
     kill_target_in(&snapshot(st, ""), e, lang)

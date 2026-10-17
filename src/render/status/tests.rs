@@ -231,6 +231,8 @@ fn msg(text: &str, error: bool) -> Message {
         text: text.into(),
         at: std::time::Instant::now(),
         error,
+        // producers mark successes with `ok_message` (copied, sourced)
+        ok: !error && (text.starts_with("copied") || text.starts_with("sourced")),
     }
 }
 

@@ -1,6 +1,7 @@
 //! tmux-like command language: tokenizer, key names, command parsing and default bindings.
 //! The helpers at the bottom back the commands that need server state (`debug-frame`,
 //! `next-attention`, `confirm-before` prompts, the first-attach hint).
+use crate::i18n::Lang;
 use crate::layout::Move;
 use crate::server::PromptKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -18,6 +19,8 @@ pub struct FrameOpts {
     pub message: Option<String>,
     pub error: bool,
     pub copy: bool,
+    /// `--lang en|zh-TW`: language of the throwaway client (None: the config's language)
+    pub lang: Option<Lang>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,6 +244,14 @@ fn prompt_spec(spec: &str) -> Result<(PromptKind, String), String> {
     Ok((kind, text.to_string()))
 }
 
+/// `--lang` value of `debug-frame`: exactly `en` or `zh-TW`.
+fn lang_flag(v: &str) -> Result<Lang, String> {
+    [Lang::En, Lang::ZhTw]
+        .into_iter()
+        .find(|l| l.code() == v)
+        .ok_or_else(|| format!("debug-frame: --lang wants en or zh-TW, got {v}"))
+}
+
 /// Flags of `debug-frame` (`-t` is read separately).
 fn frame_opts(args: &[String]) -> Result<FrameOpts, String> {
     let mut o = FrameOpts::default();
@@ -269,6 +280,7 @@ fn frame_opts(args: &[String]) -> Result<FrameOpts, String> {
                 o.prompt = Some(prompt_spec(&v)?);
             }
             "--message" => o.message = Some(option_value(args, &mut i, inline)?),
+            "--lang" => o.lang = Some(lang_flag(&option_value(args, &mut i, inline)?)?),
             other => return Err(format!("debug-frame: unknown option {other}")),
         }
     }

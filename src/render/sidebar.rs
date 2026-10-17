@@ -92,14 +92,6 @@ pub fn sidebar_text_width(st: &State, s: &Session) -> u16 {
         .saturating_sub(TEXT_INSET + RIGHT_GUTTER)
 }
 
-/// Lines the sidebar draws for session `s` in a `height`-row client (the last row is the
-/// status bar). `width` is [`sidebar_text_width`]. Uses the server's default language; a
-/// client drawn in another language must use [`sidebar_rows_lang`] (the empty-state hint can
-/// wrap to a different number of lines, which moves every row below it).
-pub fn sidebar_rows(st: &State, s: &Session, width: u16, height: u16) -> Vec<SidebarRow> {
-    sidebar_rows_lang(st, s, width, height, Lang::resolve(&st.cfg.lang, None))
-}
-
 /// [`sidebar_rows`] for a client whose UI language is `lang`.
 pub fn sidebar_rows_lang(
     st: &State,

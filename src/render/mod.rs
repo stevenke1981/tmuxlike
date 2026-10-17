@@ -5,11 +5,11 @@
 mod overlay;
 mod panes;
 mod sidebar;
-pub use sidebar::{SidebarKind, sidebar_rows, sidebar_text_width};
+pub use sidebar::{SidebarKind, sidebar_rows_lang, sidebar_text_width};
 mod status;
 
 pub use overlay::{
-    Entry, Filter, chooser_entries, kill_target, pack_chooser, unpack_chooser, visible_entries,
+    Entry, Filter, chooser_entries, kill_target_lang, pack_chooser, unpack_chooser, visible_entries,
 };
 pub use status::{status_hit_at, status_regions};
 

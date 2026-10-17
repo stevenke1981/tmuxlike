@@ -200,7 +200,7 @@ pub(crate) fn message_glyph(msg: &Message, g: &Glyphs) -> Glyph {
             tone: Tone::Err,
         };
     }
-    if msg.text.starts_with("copied") || msg.text.starts_with("sourced") {
+    if msg.ok {
         return Glyph {
             text: g.ok,
             tone: Tone::Ok,

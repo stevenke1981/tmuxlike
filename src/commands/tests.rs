@@ -1,6 +1,8 @@
 use super::*;
 use crate::api::Status;
+use crate::i18n::{tr, trf};
 use crate::theme::{ClientEnv, Theme, ThemeCfg};
+use std::fmt::Display;
 use unicode_width::UnicodeWidthStr;
 
 fn ascii_theme() -> Theme {
@@ -183,6 +185,43 @@ fn debug_frame_defaults_and_bad_flags() {
     assert!(parse("debug-frame --prompt wat:x").is_err());
 }
 
+fn frame_opts_of(line: &str) -> Result<FrameOpts, String> {
+    match parse(line)? {
+        Cmd::DebugFrame { opts, .. } => Ok(opts),
+        other => panic!("not debug-frame: {other:?}"),
+    }
+}
+
+#[test]
+fn debug_frame_lang_flag_accepts_en_and_zh_tw_in_both_forms() {
+    assert_eq!(frame_opts_of("debug-frame").unwrap().lang, None);
+    assert_eq!(
+        frame_opts_of("debug-frame --lang zh-TW").unwrap().lang,
+        Some(Lang::ZhTw)
+    );
+    assert_eq!(
+        frame_opts_of("debug-frame --lang=en").unwrap().lang,
+        Some(Lang::En)
+    );
+    // combines with the other flags and with -t
+    let Cmd::DebugFrame { target, opts } =
+        parse("debug-frame -t S --lang zh-TW --text --prefix").unwrap()
+    else {
+        panic!("not debug-frame");
+    };
+    assert_eq!(target.as_deref(), Some("S"));
+    assert!(opts.text && opts.prefix);
+    assert_eq!(opts.lang, Some(Lang::ZhTw));
+}
+
+#[test]
+fn debug_frame_lang_flag_rejects_other_languages_and_missing_values() {
+    let err = frame_opts_of("debug-frame --lang fr").unwrap_err();
+    assert!(err.contains("--lang wants en or zh-TW"), "{err}");
+    assert!(frame_opts_of("debug-frame --lang zh_TW").is_err());
+    assert!(frame_opts_of("debug-frame --lang").is_err());
+}
+
 #[test]
 fn screen_text_is_plain_rows_of_exact_width() {
     // Arrange: "ab" on row 1, a wide char at column 3 of row 1 (index 2)
@@ -306,13 +345,14 @@ fn attention_line_uses_theme_glyphs() {
     let place = Some((0, 1));
     let uni = attention_line(
         &unicode_theme(),
+        Lang::En,
         Status::Blocked,
         "claude",
         place,
         ": need approval",
     );
     assert_eq!(uni, "▲ claude 0.1 blocked: need approval");
-    let done = attention_line(&unicode_theme(), Status::Done, "codex", None, "");
+    let done = attention_line(&unicode_theme(), Lang::En, Status::Done, "codex", None, "");
     assert_eq!(done, "◆ codex done");
 }
 
@@ -320,6 +360,7 @@ fn attention_line_uses_theme_glyphs() {
 fn attention_line_is_ascii_under_ascii_theme() {
     let line = attention_line(
         &ascii_theme(),
+        Lang::En,
         Status::Blocked,
         "claude",
         Some((0, 1)),
@@ -327,18 +368,39 @@ fn attention_line_is_ascii_under_ascii_theme() {
     );
     assert_eq!(line, "! claude 0.1 blocked: need approval");
     assert!(line.is_ascii(), "{line:?}");
-    let done = attention_line(&ascii_theme(), Status::Done, "codex", None, "");
+    let done = attention_line(&ascii_theme(), Lang::En, Status::Done, "codex", None, "");
     assert!(done.is_ascii(), "{done:?}");
+}
+
+#[test]
+fn attention_line_is_translated_for_zh_tw() {
+    let line = attention_line(
+        &unicode_theme(),
+        Lang::ZhTw,
+        Status::Blocked,
+        "claude",
+        Some((0, 1)),
+        ": need approval",
+    );
+    assert_eq!(line, "▲ claude 0.1 待回應: need approval");
+    let done = attention_line(
+        &unicode_theme(),
+        Lang::ZhTw,
+        Status::Done,
+        "codex",
+        None,
+        "",
+    );
+    assert_eq!(done, "◆ codex 已完成");
 }
 
 #[test]
 fn blocked_toast_is_ascii_under_ascii_theme() {
     let toast = blocked_toast(
         &ascii_theme(),
+        Lang::En,
         "claude",
-        "work",
-        1,
-        2,
+        ("work", 1, 2),
         ": need approval",
         "C-b",
     );
@@ -347,24 +409,336 @@ fn blocked_toast_is_ascii_under_ascii_theme() {
         "! claude blocked in work 1.2: need approval (C-b Tab)"
     );
     assert!(toast.is_ascii(), "{toast:?}");
-    let uni = blocked_toast(&unicode_theme(), "claude", "work", 1, 2, "", "C-b");
+    let uni = blocked_toast(
+        &unicode_theme(),
+        Lang::En,
+        "claude",
+        ("work", 1, 2),
+        "",
+        "C-b",
+    );
     assert!(uni.starts_with("▲ claude blocked"), "{uni:?}");
 }
 
 #[test]
+fn blocked_toast_is_translated_for_zh_tw() {
+    let toast = blocked_toast(
+        &unicode_theme(),
+        Lang::ZhTw,
+        "claude",
+        ("work", 1, 2),
+        ": need approval",
+        "C-b",
+    );
+    assert_eq!(
+        toast,
+        "▲ claude 在 work 1.2 待回應: need approval（C-b Tab）"
+    );
+}
+
+#[test]
 fn attach_hint_separator_follows_theme() {
-    let ascii = attach_hint_text(&ascii_theme(), "C-b");
+    let ascii = attach_hint_text(&ascii_theme(), Lang::En, "C-b");
     assert_eq!(ascii, "C-b ? keys . C-b a agents . C-b Tab next alert");
     assert!(ascii.is_ascii(), "{ascii:?}");
-    assert!(attach_hint_text(&unicode_theme(), "C-b").contains(" · "));
+    assert!(attach_hint_text(&unicode_theme(), Lang::En, "C-b").contains(" · "));
+    let zh = attach_hint_text(&unicode_theme(), Lang::ZhTw, "C-b");
+    assert_eq!(zh, "C-b ? 按鍵 · C-b a 代理 · C-b Tab 下一個提醒");
 }
 
 #[test]
 fn session_ended_notice_dash_follows_theme() {
-    let ascii = session_ended_text(&ascii_theme(), "work", "main");
+    let ascii = session_ended_text(&ascii_theme(), Lang::En, "work", "main");
     assert_eq!(ascii, "session work ended - now in main");
     assert!(ascii.is_ascii(), "{ascii:?}");
-    assert!(session_ended_text(&unicode_theme(), "work", "main").contains('—'));
+    assert!(session_ended_text(&unicode_theme(), Lang::En, "work", "main").contains('—'));
+    let zh = session_ended_text(&unicode_theme(), Lang::ZhTw, "work", "main");
+    assert_eq!(zh, "工作階段 work 已結束 — 已切換到 main");
+}
+
+#[test]
+fn status_words_keep_api_values_in_english() {
+    for s in [
+        Status::Idle,
+        Status::Working,
+        Status::Blocked,
+        Status::Done,
+        Status::Unknown,
+    ] {
+        assert_eq!(status_word(Lang::En, s), s.as_str());
+        assert_ne!(status_word(Lang::ZhTw, s), s.as_str(), "{s:?}");
+    }
+    assert_eq!(status_word(Lang::ZhTw, Status::Working), "執行中");
+    assert_eq!(status_word(Lang::ZhTw, Status::Blocked), "待回應");
+}
+
+#[test]
+fn counts_and_blocked_note_follow_language() {
+    let n = |lang, key| trf(lang, key, &[("n", &3 as &dyn Display)]);
+    assert_eq!(n(Lang::En, "messages.count.pane.other"), "3 panes");
+    assert_eq!(n(Lang::ZhTw, "messages.count.pane.other"), "3 個窗格");
+    assert_eq!(n(Lang::En, "messages.count.window.one"), "3 window");
+    assert_eq!(n(Lang::ZhTw, "messages.count.window.one"), "3 個視窗");
+    assert_eq!(
+        trf(
+            Lang::En,
+            "messages.blocked_note",
+            &[("n", &2 as &dyn Display)]
+        ),
+        ", 2 blocked"
+    );
+    assert_eq!(
+        trf(
+            Lang::ZhTw,
+            "messages.blocked_note",
+            &[("n", &2 as &dyn Display)]
+        ),
+        "，2 個待回應"
+    );
+}
+
+#[test]
+fn key_header_is_translated_and_keeps_key_names() {
+    let en = trf(
+        Lang::En,
+        "messages.key_header",
+        &[("prefix", &"C-b" as &dyn Display)],
+    );
+    assert_eq!(en, "prefix = C-b   (j/k/Space scroll, q closes)");
+    let zh = trf(
+        Lang::ZhTw,
+        "messages.key_header",
+        &[("prefix", &"C-b" as &dyn Display)],
+    );
+    assert_eq!(zh, "前綴鍵 = C-b   （j/k/Space 捲動，q 關閉）");
+}
+
+/// (key, arguments, English, zh-TW) of one message.
+type MessageCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str, &'a str);
+
+#[test]
+fn tui_messages_format_in_english_and_zh_tw() {
+    // the English must stay exactly as before the i18n work
+    let cases: Vec<MessageCase> = vec![
+        ("messages.cancelled", vec![], "cancelled", "已取消"),
+        (
+            "messages.target_changed",
+            vec![],
+            "target changed - not killed",
+            "目標已變更，未關閉",
+        ),
+        (
+            "messages.no_attention",
+            vec![],
+            "no pane needs attention",
+            "沒有需要關注的窗格",
+        ),
+        (
+            "messages.pane_close_hint",
+            vec![],
+            "panes close with C-b x (kill-pane)",
+            "窗格請用 C-b x 關閉（kill-pane）",
+        ),
+        (
+            "messages.copied",
+            vec![("n", "5")],
+            "copied 5 characters",
+            "已複製 5 個字元",
+        ),
+        (
+            "messages.sourced",
+            vec![("path", "/c/t.conf")],
+            "sourced /c/t.conf",
+            "已重新載入設定 /c/t.conf",
+        ),
+        (
+            "messages.detached",
+            vec![("session", "work")],
+            "detached (from session work)",
+            "已離開（工作階段 work）",
+        ),
+        (
+            "messages.session_ended",
+            vec![("session", "work"), ("dash", "-"), ("other", "main")],
+            "session work ended - now in main",
+            "工作階段 work 已結束 - 已切換到 main",
+        ),
+        (
+            "messages.key_header",
+            vec![("prefix", "C-b")],
+            "prefix = C-b   (j/k/Space scroll, q closes)",
+            "前綴鍵 = C-b   （j/k/Space 捲動，q 關閉）",
+        ),
+        (
+            "messages.unbound",
+            vec![("prefix", "C-b"), ("key", "Q")],
+            "C-b Q is not bound (C-b ? lists keys)",
+            "C-b Q 未綁定（C-b ? 列出按鍵）",
+        ),
+        ("messages.exited", vec![], "exited", "已結束"),
+        (
+            "messages.session_killed",
+            vec![],
+            "session killed",
+            "工作階段已關閉",
+        ),
+    ];
+    for (key, args, en, zh) in cases {
+        let args: Vec<(&str, &dyn Display)> =
+            args.iter().map(|(n, v)| (*n, v as &dyn Display)).collect();
+        assert_eq!(trf(Lang::En, key, &args), en, "{key} en");
+        assert_eq!(trf(Lang::ZhTw, key, &args), zh, "{key} zh-TW");
+    }
+    // the status word is translated per language before it is passed in
+    let kill_pane = |lang| {
+        let status = status_word(lang, Status::Working);
+        trf(
+            lang,
+            "messages.kill_pane",
+            &[
+                ("pane", &"p2" as &dyn Display),
+                ("who", &"codex"),
+                ("status", &status),
+            ],
+        )
+    };
+    assert_eq!(kill_pane(Lang::En), "kill pane p2 (codex, working)?");
+    assert_eq!(kill_pane(Lang::ZhTw), "關閉窗格 p2（codex，執行中）？");
+    // counts and the blocked note are formatted per language, as `confirm_prompt_text` does
+    let kill_window = |lang| {
+        let count = count(
+            lang,
+            2,
+            "messages.count.pane.one",
+            "messages.count.pane.other",
+        );
+        let blocked = trf(lang, "messages.blocked_note", &[("n", &1 as &dyn Display)]);
+        trf(
+            lang,
+            "messages.kill_window",
+            &[
+                ("name", &"build" as &dyn Display),
+                ("count", &count),
+                ("blocked", &blocked),
+            ],
+        )
+    };
+    assert_eq!(
+        kill_window(Lang::En),
+        "kill window build (2 panes, 1 blocked)?"
+    );
+    assert_eq!(
+        kill_window(Lang::ZhTw),
+        "關閉視窗 build（2 個窗格，1 個待回應）？"
+    );
+    let kill_session = |lang| {
+        let count = count(
+            lang,
+            3,
+            "messages.count.window.one",
+            "messages.count.window.other",
+        );
+        trf(
+            lang,
+            "messages.kill_session",
+            &[
+                ("name", &"work" as &dyn Display),
+                ("count", &count),
+                ("blocked", &""),
+            ],
+        )
+    };
+    assert_eq!(kill_session(Lang::En), "kill session work (3 windows)?");
+    assert_eq!(kill_session(Lang::ZhTw), "關閉工作階段 work（3 個視窗）？");
+}
+
+#[test]
+fn localize_leaves_english_unchanged() {
+    for text in [
+        "unknown command: frob",
+        "can't find session: work",
+        "lang: expected auto|en|zh-TW, got fr",
+        "copied 3 characters",
+        "sourced /x/y.conf",
+        "something unknown",
+    ] {
+        assert_eq!(localize(Lang::En, text), text);
+    }
+}
+
+#[test]
+fn localize_translates_known_errors_and_keeps_values() {
+    assert_eq!(
+        localize(Lang::ZhTw, "unknown command: frob"),
+        "未知指令：frob"
+    );
+    assert_eq!(
+        localize(Lang::ZhTw, "can't find session: my.work"),
+        "找不到工作階段：my.work"
+    );
+    assert_eq!(
+        localize(Lang::ZhTw, "lang: expected auto|en|zh-TW, got fr"),
+        "lang：應為 auto、en 或 zh-TW，收到 fr"
+    );
+    assert_eq!(
+        localize(Lang::ZhTw, "sourced /x/y.conf"),
+        "已重新載入設定 /x/y.conf"
+    );
+    assert_eq!(localize(Lang::ZhTw, "exited"), "已結束");
+    assert_eq!(
+        localize(Lang::ZhTw, "usage: set OPTION VALUE"),
+        "用法：set OPTION VALUE"
+    );
+}
+
+#[test]
+fn localize_translates_each_part_of_joined_errors_and_nested_values() {
+    assert_eq!(
+        localize(Lang::ZhTw, "no sessions; unknown option: nope"),
+        "沒有工作階段; 未知選項：nope"
+    );
+    assert_eq!(
+        localize(Lang::ZhTw, "bind C-k: unknown key: ab"),
+        "bind C-k：未知按鍵：ab"
+    );
+}
+
+#[test]
+fn localize_passes_unmatched_text_through() {
+    assert_eq!(
+        localize(Lang::ZhTw, "no such thing here"),
+        "no such thing here"
+    );
+}
+
+#[test]
+fn every_localized_error_key_has_a_zh_tw_text_with_the_same_placeholders() {
+    for key in LOCALIZED_ERRORS {
+        let en = tr(Lang::En, key);
+        let zh = tr(Lang::ZhTw, key);
+        assert_ne!(en, *key, "{key} missing in catalog");
+        assert_ne!(zh, *key, "{key} missing zh-TW text");
+        assert!(en.contains('{') == zh.contains('{'), "{key}");
+    }
+}
+
+#[test]
+fn shared_code_errors_are_all_matched_by_their_templates() {
+    // sample errors as the parser and server build them; each must be translated
+    let samples = [
+        parse("frobnicate").unwrap_err(),
+        parse("set").unwrap_err(),
+        parse("confirm-before").unwrap_err(),
+        parse("bind-key x").unwrap_err(),
+        parse("unbind-key").unwrap_err(),
+        parse("resize-pane").unwrap_err(),
+        parse("select-window -t x").unwrap_err(),
+        parse("bind-key ab display").unwrap_err(),
+        parse("").unwrap_err(),
+    ];
+    for s in samples {
+        assert_ne!(localize(Lang::ZhTw, &s), s, "not translated: {s}");
+    }
 }
 
 #[test]
