@@ -101,6 +101,7 @@ pub fn new_detached(session: Option<String>) -> Result<()> {
             rows,
             cwd,
             detached: true,
+            env: crate::theme::ClientEnv::detect(),
         }),
     )?;
     match read_msg::<ServerMsg>(&mut r)? {
@@ -134,6 +135,7 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
             rows,
             cwd,
             detached: false,
+            env: crate::theme::ClientEnv::detect(),
         }),
     )?;
 
@@ -178,7 +180,7 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
                     let _ = tx.send(format!("error: {e}"));
                     return;
                 }
-                Ok(ServerMsg::Text(_)) => {}
+                Ok(ServerMsg::Text(_) | ServerMsg::Api(_)) => {}
                 Err(_) => {
                     let _ = tx.send("server exited".into());
                     return;
@@ -209,4 +211,39 @@ pub fn attach(session: Option<String>, create: bool) -> Result<()> {
     terminal::disable_raw_mode()?;
     println!("[{reason}]");
     Ok(())
+}
+
+/// herdr-style API command: prints `{"result": ...}` JSON (or raw text) on stdout and
+/// returns 0; on failure prints `{"error": {code, message}}` on stderr and returns 1.
+pub fn api(req: crate::api::Request) -> Result<i32> {
+    use crate::api::{ApiError, Reply};
+    let s = match connect(false) {
+        Ok(s) => s,
+        Err(e) => {
+            let err = ApiError::new("server_not_running", e.to_string());
+            eprintln!("{}", serde_json::json!({ "error": err }));
+            return Ok(1);
+        }
+    };
+    let (mut r, mut w) = s.split();
+    write_msg(&mut w, &ClientMsg::Hello(Command::Api(req)))?;
+    match read_msg::<ServerMsg>(&mut r)? {
+        ServerMsg::Api(Ok(Reply::Json(v))) => {
+            println!("{}", serde_json::json!({ "result": v }));
+            Ok(0)
+        }
+        ServerMsg::Api(Ok(Reply::Text(t))) => {
+            print!("{t}");
+            if !t.is_empty() && !t.ends_with('\n') {
+                println!();
+            }
+            Ok(0)
+        }
+        ServerMsg::Api(Err(e)) => {
+            eprintln!("{}", serde_json::json!({ "error": e }));
+            Ok(1)
+        }
+        ServerMsg::Error(e) => Err(anyhow!(e)),
+        _ => Err(anyhow!("unexpected reply from server")),
+    }
 }

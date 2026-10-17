@@ -47,7 +47,7 @@ open(CFG,"w").write('shell = "bash --norc --noprofile"\n[bind]\ny = "display rel
 os.write(fd,P+b"r"); o=rd(fd); chk("source-file message", b"sourced" in o)
 os.write(fd,P+b"y"); o=rd(fd); chk("reloaded binding", b"reloaded-ok" in o)
 os.write(fd,P+b"c"); rd(fd); os.write(fd,b"sleep 6\r"); o=rd(fd,4); chk("automatic rename", "1:sleep" in scr())
-os.write(fd,P+b"s"); o=rd(fd); chk("chooser", b"choose session" in o and b"work: 2 windows" in o)
+os.write(fd,P+b"s"); o=rd(fd); chk("chooser", b"Sessions" in o and b"work: 2 windows" in o)
 os.write(fd,b"\x1b[A\r"); rd(fd)
 os.write(fd,P+b"?"); os.write(fd,b"          "); o=rd(fd); chk("list-keys popup scroll", "new-window" in scr())
 os.write(fd,b"q"); rd(fd)

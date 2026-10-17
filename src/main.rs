@@ -11,16 +11,20 @@ macro_rules! log {
     }};
 }
 
+mod api;
 mod client;
 mod commands;
 mod config;
 mod copy;
+mod input;
 mod ipc;
 mod keys;
 mod layout;
+mod persist;
 mod proto;
 mod render;
 mod server;
+mod theme;
 
 use proto::Command;
 
@@ -39,6 +43,11 @@ USAGE:
   tmuxlike source-file [PATH]    reload config in the running server
   tmuxlike <command> [args]      run any server command, e.g. `tmuxlike set mouse off`
 
+AUTOMATION (herdr-style, JSON output; see `tmuxlike pane --help`):
+  tmuxlike pane list|get|split|read|send-text|send-keys|run|wait-output|...
+  tmuxlike agent list|get|read|prompt|wait|rename|focus|send-keys
+  tmuxlike session list   tmuxlike api snapshot   tmuxlike server [stop]
+
 Config: $TMUXLIKE_CONFIG or <config_dir>/tmuxlike/config.toml";
 
 const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
@@ -47,7 +56,9 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
   \"  or -     split top/bottom     arrows/hjkl move focus
   Ctrl/Alt+arrows, H J K L  resize pane
   o          next pane            z          zoom pane
-  x          kill pane            &          kill window
+  x          kill pane (y/n)      &          kill window (y/n)
+  Tab        next pane needing you (blocked first, then done)
+  BTab       previous such pane   g          tree chooser (like s / w)
   [ / PgUp   copy mode (hjkl, v/V select, y copy, q exit)
   ]          paste buffer         :          command prompt
   ,          rename window        $          rename session
@@ -55,7 +66,12 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
   a  or b    toggle sidebar       r          reload config
   ?          list keys            d          detach
   Ctrl-b     send prefix to the program
-Mouse: click to focus pane / select window in status bar, wheel to scroll, drag to copy.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
+Options (`set NAME VALUE` or config.toml):
+  hints on|off            status-bar key hints and the first-attach tip (default on)
+  confirm-close on|off    y/n before x and & (default on; off = kill at once)
+  pane-titles off|auto|always  title row per pane (auto: split window + agent/label)
+Mouse: click a pane or its title to focus, a window label to switch, the session chip for
+the chooser, the counters for the next alert, a sidebar row to jump; wheel scrolls; drag copies.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
 
 fn flag(args: &[String], f: &str) -> Option<String> {
     args.iter()
@@ -68,6 +84,26 @@ fn main() {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     let res = match sub {
         "__server" => server::run(),
+        "server" if args.len() == 1 => server::run(),
+        g if api::cli::API_COMMANDS.contains(&g) => {
+            let current = std::env::var("TMUXLIKE_PANE_ID")
+                .ok()
+                .and_then(|v| api::parse_pane_id(&v));
+            match api::cli::parse(&args, current) {
+                Ok(req) => match client::api(req) {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => Err(e),
+                },
+                Err(help) if help == api::cli::HELP => {
+                    println!("{help}");
+                    Ok(())
+                }
+                Err(usage) => {
+                    eprintln!("tmuxlike: {usage}");
+                    std::process::exit(2);
+                }
+            }
+        }
         "" => client::attach(None, false).or_else(|_| client::attach(None, true)),
         "new" | "new-session" if args.iter().any(|a| a == "-d") => {
             client::new_detached(flag(&args, "-s"))

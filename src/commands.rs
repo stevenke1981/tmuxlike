@@ -1,6 +1,24 @@
 //! tmux-like command language: tokenizer, key names, command parsing and default bindings.
+//! The helpers at the bottom back the commands that need server state (`debug-frame`,
+//! `next-attention`, `confirm-before` prompts, the first-attach hint).
 use crate::layout::Move;
+use crate::server::PromptKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Options of `debug-frame`: test hooks that set fields on a throwaway client.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FrameOpts {
+    /// print plain text rows instead of the ANSI frame
+    pub text: bool,
+    pub prefix: bool,
+    pub prompt: Option<(PromptKind, String)>,
+    /// `--chooser` (bare: the target's current window) or `--chooser=N`
+    pub chooser: Option<Option<usize>>,
+    pub popup: bool,
+    pub message: Option<String>,
+    pub error: bool,
+    pub copy: bool,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
@@ -13,8 +31,14 @@ pub enum Cmd {
     RenameWindow(Option<String>),
     RenameSession(Option<String>),
     KillPane,
-    KillWindow,
-    KillSession,
+    /// `SESSION:IDX`; default is the current window
+    KillWindow {
+        target: Option<String>,
+    },
+    /// session name; default is the current session
+    KillSession {
+        target: Option<String>,
+    },
     KillServer,
     SelectPane(Move),
     NextPane,
@@ -43,6 +67,7 @@ pub enum Cmd {
     ListKeys,
     DebugFrame {
         target: Option<String>,
+        opts: FrameOpts,
     },
     CapturePane {
         target: Option<String>,
@@ -53,6 +78,56 @@ pub enum Cmd {
         literal: bool,
         keys: Vec<String>,
     },
+    /// jump to the next (or, with `-p`, previous) pane that needs attention
+    NextAttention {
+        backward: bool,
+    },
+    /// y/n question before `command`; `prompt` overrides the generated question
+    ConfirmBefore {
+        prompt: Option<String>,
+        command: String,
+    },
+}
+
+impl Cmd {
+    /// Command name as typed, for error messages (`"kill-pane" needs an attached client`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Cmd::SplitWindow { .. } => "split-window",
+            Cmd::NewWindow { .. } => "new-window",
+            Cmd::RenameWindow(_) => "rename-window",
+            Cmd::RenameSession(_) => "rename-session",
+            Cmd::KillPane => "kill-pane",
+            Cmd::KillWindow { .. } => "kill-window",
+            Cmd::KillSession { .. } => "kill-session",
+            Cmd::KillServer => "kill-server",
+            Cmd::SelectPane(_) => "select-pane",
+            Cmd::NextPane => "next-pane",
+            Cmd::ResizePane(..) | Cmd::Zoom => "resize-pane",
+            Cmd::NextWindow => "next-window",
+            Cmd::PrevWindow => "previous-window",
+            Cmd::SelectWindow(_) => "select-window",
+            Cmd::CopyMode { .. } => "copy-mode",
+            Cmd::PasteBuffer => "paste-buffer",
+            Cmd::Detach => "detach-client",
+            Cmd::ChooseTree => "choose-tree",
+            Cmd::ToggleSidebar => "toggle-sidebar",
+            Cmd::SourceFile(_) => "source-file",
+            Cmd::Set(..) => "set-option",
+            Cmd::BindKey(..) => "bind-key",
+            Cmd::UnbindKey(_) => "unbind-key",
+            Cmd::CommandPrompt => "command-prompt",
+            Cmd::SwitchClient { .. } => "switch-client",
+            Cmd::SendPrefix => "send-prefix",
+            Cmd::DisplayMessage(_) => "display-message",
+            Cmd::ListKeys => "list-keys",
+            Cmd::DebugFrame { .. } => "debug-frame",
+            Cmd::CapturePane { .. } => "capture-pane",
+            Cmd::SendKeys { .. } => "send-keys",
+            Cmd::NextAttention { .. } => "next-attention",
+            Cmd::ConfirmBefore { .. } => "confirm-before",
+        }
+    }
 }
 
 /// Split a command line into words, honouring '...' "..." and backslash escapes.
@@ -138,6 +213,93 @@ fn positional(args: &[String], with_val: &[&str]) -> Vec<String> {
     v
 }
 
+/// Value of a `--flag VALUE` or `--flag=VALUE` option; `i` points past the flag.
+fn option_value(args: &[String], i: &mut usize, inline: Option<String>) -> Result<String, String> {
+    if let Some(v) = inline {
+        return Ok(v);
+    }
+    let v = args
+        .get(*i)
+        .cloned()
+        .ok_or_else(|| "debug-frame: option needs a value".to_string())?;
+    *i += 1;
+    Ok(v)
+}
+
+/// `KIND:TEXT` for `debug-frame --prompt`.
+fn prompt_spec(spec: &str) -> Result<(PromptKind, String), String> {
+    let (kind, text) = spec
+        .split_once(':')
+        .ok_or("debug-frame: --prompt wants KIND:TEXT")?;
+    let kind = match kind {
+        "command" => PromptKind::Command,
+        "rename-window" => PromptKind::RenameWindow,
+        "rename-session" => PromptKind::RenameSession,
+        "confirm" => PromptKind::Confirm,
+        other => return Err(format!("debug-frame: unknown prompt kind {other:?}")),
+    };
+    Ok((kind, text.to_string()))
+}
+
+/// Flags of `debug-frame` (`-t` is read separately).
+fn frame_opts(args: &[String]) -> Result<FrameOpts, String> {
+    let mut o = FrameOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        let (flag, inline) = match args[i].split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (args[i].as_str(), None),
+        };
+        i += 1;
+        match flag {
+            "-t" => i += 1,
+            "--text" => o.text = true,
+            "--prefix" => o.prefix = true,
+            "--popup" => o.popup = true,
+            "--copy" => o.copy = true,
+            "--error" => o.error = true,
+            "--chooser" => {
+                o.chooser = Some(match inline {
+                    Some(n) => Some(n.parse().map_err(|_| format!("bad chooser index: {n}"))?),
+                    None => None,
+                })
+            }
+            "--prompt" => {
+                let v = option_value(args, &mut i, inline)?;
+                o.prompt = Some(prompt_spec(&v)?);
+            }
+            "--message" => o.message = Some(option_value(args, &mut i, inline)?),
+            other => return Err(format!("debug-frame: unknown option {other}")),
+        }
+    }
+    Ok(o)
+}
+
+/// `confirm-before [-p TEXT] CMD...`. A single word is taken as a whole command line
+/// (`"kill-window -t x"`); several words are re-quoted into one.
+fn confirm_before(args: &[String]) -> Result<Cmd, String> {
+    let mut prompt = None;
+    let mut rest: Vec<String> = vec![];
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-p" && rest.is_empty() && prompt.is_none() {
+            prompt = Some(it.next().cloned().ok_or("confirm-before: -p needs TEXT")?);
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    if rest.is_empty() {
+        return Err("usage: confirm-before [-p TEXT] CMD".into());
+    }
+    let command = if rest.len() == 1 {
+        rest.remove(0)
+    } else {
+        rest.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
+    };
+    parse(&command)?; // validate, like bind-key
+    Ok(Cmd::ConfirmBefore { prompt, command })
+}
+
 pub fn parse(line: &str) -> Result<Cmd, String> {
     let toks = tokenize(line);
     let Some((name, args)) = toks.split_first() else {
@@ -162,8 +324,12 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "rename-window" | "renamew" => Cmd::RenameWindow(rest()),
         "rename-session" | "rename" => Cmd::RenameSession(rest()),
         "kill-pane" | "killp" => Cmd::KillPane,
-        "kill-window" | "killw" => Cmd::KillWindow,
-        "kill-session" => Cmd::KillSession,
+        "kill-window" | "killw" => Cmd::KillWindow {
+            target: flag_val(args, "-t"),
+        },
+        "kill-session" => Cmd::KillSession {
+            target: flag_val(args, "-t"),
+        },
         "kill-server" => Cmd::KillServer,
         "select-pane" | "selectp" => match args.iter().find_map(|a| dir_flag(a)) {
             Some(m) => Cmd::SelectPane(m),
@@ -189,7 +355,7 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "previous-window" | "prev" => Cmd::PrevWindow,
         "select-window" | "selectw" => {
             let t = flag_val(args, "-t")
-                .or_else(|| rest())
+                .or_else(rest)
                 .ok_or("select-window: need -t N")?;
             Cmd::SelectWindow(
                 t.trim_start_matches(':')
@@ -252,7 +418,12 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
         "list-keys" | "lsk" => Cmd::ListKeys,
         "debug-frame" => Cmd::DebugFrame {
             target: flag_val(args, "-t"),
+            opts: frame_opts(args)?,
         },
+        "next-attention" => Cmd::NextAttention {
+            backward: has("-p"),
+        },
+        "confirm-before" | "confirm" => confirm_before(args)?,
         "capture-pane" | "capturep" => Cmd::CapturePane {
             target: flag_val(args, "-t"),
             print: has("-p"),
@@ -268,49 +439,50 @@ pub fn parse(line: &str) -> Result<Cmd, String> {
 
 /// Bytes for one `send-keys` argument: a key name (Enter, C-c, Up, ...) or literal text.
 pub fn send_key_bytes(arg: &str, literal: bool) -> Vec<u8> {
-    if !literal && arg.chars().count() > 1 {
-        if let Ok(n) = normalize_key(arg) {
-            let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
-            loop {
-                if let Some(r) = rest.strip_prefix("C-") {
-                    mods |= KeyModifiers::CONTROL;
-                    rest = r;
-                } else if let Some(r) = rest.strip_prefix("M-") {
-                    mods |= KeyModifiers::ALT;
-                    rest = r;
-                } else if let Some(r) = rest.strip_prefix("S-") {
-                    mods |= KeyModifiers::SHIFT;
-                    rest = r;
-                } else {
-                    break;
-                }
+    if !literal
+        && arg.chars().count() > 1
+        && let Ok(n) = normalize_key(arg)
+    {
+        let (mut rest, mut mods) = (n.as_str(), KeyModifiers::NONE);
+        loop {
+            if let Some(r) = rest.strip_prefix("C-") {
+                mods |= KeyModifiers::CONTROL;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("M-") {
+                mods |= KeyModifiers::ALT;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("S-") {
+                mods |= KeyModifiers::SHIFT;
+                rest = r;
+            } else {
+                break;
             }
-            let code = match rest {
-                "Space" => Some(KeyCode::Char(' ')),
-                "Enter" => Some(KeyCode::Enter),
-                "Tab" => Some(KeyCode::Tab),
-                "BTab" => Some(KeyCode::BackTab),
-                "Escape" => Some(KeyCode::Esc),
-                "BSpace" => Some(KeyCode::Backspace),
-                "Up" => Some(KeyCode::Up),
-                "Down" => Some(KeyCode::Down),
-                "Left" => Some(KeyCode::Left),
-                "Right" => Some(KeyCode::Right),
-                "Home" => Some(KeyCode::Home),
-                "End" => Some(KeyCode::End),
-                "PageUp" => Some(KeyCode::PageUp),
-                "PageDown" => Some(KeyCode::PageDown),
-                "Insert" => Some(KeyCode::Insert),
-                "Delete" => Some(KeyCode::Delete),
-                f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
-                    Some(KeyCode::F(f[1..].parse().unwrap()))
-                }
-                c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
-                _ => None,
-            };
-            if let Some(code) = code {
-                return crate::keys::encode(&KeyEvent::new(code, mods), false);
+        }
+        let code = match rest {
+            "Space" => Some(KeyCode::Char(' ')),
+            "Enter" => Some(KeyCode::Enter),
+            "Tab" => Some(KeyCode::Tab),
+            "BTab" => Some(KeyCode::BackTab),
+            "Escape" => Some(KeyCode::Esc),
+            "BSpace" => Some(KeyCode::Backspace),
+            "Up" => Some(KeyCode::Up),
+            "Down" => Some(KeyCode::Down),
+            "Left" => Some(KeyCode::Left),
+            "Right" => Some(KeyCode::Right),
+            "Home" => Some(KeyCode::Home),
+            "End" => Some(KeyCode::End),
+            "PageUp" => Some(KeyCode::PageUp),
+            "PageDown" => Some(KeyCode::PageDown),
+            "Insert" => Some(KeyCode::Insert),
+            "Delete" => Some(KeyCode::Delete),
+            f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
+                Some(KeyCode::F(f[1..].parse().unwrap()))
             }
+            c if c.chars().count() == 1 => Some(KeyCode::Char(c.chars().next().unwrap())),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return crate::keys::encode(&KeyEvent::new(code, mods), false);
         }
     }
     arg.as_bytes().to_vec()
@@ -480,8 +652,10 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("K", "resize-pane -U 3"),
     ("J", "resize-pane -D 3"),
     ("z", "resize-pane -Z"),
-    ("x", "kill-pane"),
-    ("&", "kill-window"),
+    ("x", "confirm-before kill-pane"),
+    ("&", "confirm-before kill-window"),
+    ("Tab", "next-attention"),
+    ("BTab", "next-attention -p"),
     ("[", "copy-mode"),
     ("PageUp", "copy-mode -u"),
     ("]", "paste-buffer"),
@@ -489,6 +663,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("b", "toggle-sidebar"),
     ("s", "choose-tree"),
     ("w", "choose-tree"),
+    ("g", "choose-tree"),
     ("(", "switch-client -p"),
     (")", "switch-client -n"),
     ("d", "detach-client"),
@@ -499,129 +674,8 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("?", "list-keys"),
 ];
 
+mod ui;
+pub use ui::*;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenize_quotes() {
-        assert_eq!(
-            tokenize(r#"rename-window "my win"  x"#),
-            vec!["rename-window", "my win", "x"]
-        );
-        assert_eq!(
-            tokenize(r#"display 'a b' c\ d # comment"#),
-            vec!["display", "a b", "c d"]
-        );
-        assert_eq!(tokenize(r#"set x """#), vec!["set", "x", ""]);
-    }
-
-    #[test]
-    fn parse_commands() {
-        assert_eq!(
-            parse("splitw -h").unwrap(),
-            Cmd::SplitWindow { horizontal: true }
-        );
-        assert_eq!(
-            parse("split-window").unwrap(),
-            Cmd::SplitWindow { horizontal: false }
-        );
-        assert_eq!(
-            parse("resize-pane -L 10").unwrap(),
-            Cmd::ResizePane(Move::Left, 10)
-        );
-        assert_eq!(parse("resize-pane -Z").unwrap(), Cmd::Zoom);
-        assert_eq!(parse("select-pane -U").unwrap(), Cmd::SelectPane(Move::Up));
-        assert_eq!(parse("select-pane -t :.+").unwrap(), Cmd::NextPane);
-        assert_eq!(parse("select-window -t :3").unwrap(), Cmd::SelectWindow(3));
-        assert_eq!(
-            parse("rename-window hello world").unwrap(),
-            Cmd::RenameWindow(Some("hello world".into()))
-        );
-        assert_eq!(parse("rename-window").unwrap(), Cmd::RenameWindow(None));
-        assert_eq!(
-            parse("set -g mouse off").unwrap(),
-            Cmd::Set("mouse".into(), "off".into())
-        );
-        assert_eq!(
-            parse("new-window -n logs").unwrap(),
-            Cmd::NewWindow {
-                name: Some("logs".into())
-            }
-        );
-        assert_eq!(
-            parse("bind-key C-k display \"hi there\"").unwrap(),
-            Cmd::BindKey("C-k".into(), "display \"hi there\"".into())
-        );
-        assert_eq!(
-            parse("bind -r M-h resize-pane -L 2").unwrap(),
-            Cmd::BindKey("M-h".into(), "resize-pane -L 2".into())
-        );
-        assert!(parse("bind x bogus").is_err());
-        assert_eq!(
-            parse("unbind PPage").unwrap(),
-            Cmd::UnbindKey("PageUp".into())
-        );
-        assert!(parse("frobnicate").is_err());
-        for (k, c) in DEFAULT_BINDINGS {
-            assert!(parse(c).is_ok(), "{c}");
-            assert_eq!(&normalize_key(k).unwrap(), k);
-        }
-    }
-
-    #[test]
-    fn send_keys() {
-        assert_eq!(send_key_bytes("Enter", false), b"\r");
-        assert_eq!(send_key_bytes("C-c", false), vec![3]);
-        assert_eq!(send_key_bytes("echo hi", false), b"echo hi");
-        assert_eq!(send_key_bytes("Enter", true), b"Enter");
-        assert_eq!(send_key_bytes("x", false), b"x");
-        assert_eq!(
-            parse("send-keys -t s1 'echo ok' Enter").unwrap(),
-            Cmd::SendKeys {
-                target: Some("s1".into()),
-                literal: false,
-                keys: vec!["echo ok".into(), "Enter".into()]
-            }
-        );
-        assert_eq!(
-            parse("capture-pane -p -t x").unwrap(),
-            Cmd::CapturePane {
-                target: Some("x".into()),
-                print: true
-            }
-        );
-    }
-
-    #[test]
-    fn keys() {
-        assert_eq!(normalize_key("C-a").unwrap(), "C-a");
-        assert_eq!(normalize_key("^B").unwrap(), "C-b");
-        assert_eq!(normalize_key("m-left").unwrap(), "M-Left");
-        assert_eq!(normalize_key("C-M-x").unwrap(), "C-M-x");
-        assert_eq!(normalize_key("npage").unwrap(), "PageDown");
-        assert_eq!(normalize_key("-").unwrap(), "-");
-        assert_eq!(normalize_key("F5").unwrap(), "F5");
-        let ev = |c, m| KeyEvent::new(c, m);
-        assert_eq!(
-            key_name(&ev(KeyCode::Char('a'), KeyModifiers::CONTROL)).unwrap(),
-            "C-a"
-        );
-        assert_eq!(
-            key_name(&ev(KeyCode::Char('A'), KeyModifiers::SHIFT)).unwrap(),
-            "A"
-        );
-        assert_eq!(
-            key_name(&ev(KeyCode::Char('%'), KeyModifiers::SHIFT)).unwrap(),
-            "%"
-        );
-        assert_eq!(
-            key_name(&ev(KeyCode::Left, KeyModifiers::ALT)).unwrap(),
-            "M-Left"
-        );
-        assert_eq!(
-            key_name(&ev(KeyCode::Char('\u{2}'), KeyModifiers::NONE)).unwrap(),
-            "C-b"
-        );
-    }
-}
+mod tests;

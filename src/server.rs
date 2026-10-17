@@ -1,5 +1,5 @@
 //! The multiplexer server: owns sessions, windows, panes (ptys) and renders frames for clients.
-use crate::commands::{self, Cmd, key_name};
+use crate::commands::{self, Cmd};
 use crate::config::{Config, config_path};
 use crate::copy::{self, CopyState};
 use crate::ipc;
@@ -8,9 +8,7 @@ use crate::layout::{Dir, Move, Node, Rect, neighbor};
 use crate::proto::{ClientMsg, Command, ServerMsg, read_msg, write_msg};
 use crate::render::{Frame, chooser_entries, render_client};
 use anyhow::{Result, anyhow};
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use interprocess::local_socket::prelude::*;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{BTreeMap, HashMap};
@@ -26,10 +24,32 @@ pub struct Pane {
     pub rect: Rect,
     pub last_output: Instant,
     pub attention: bool,
+    /// when the pane was spawned; startup output does not count as unseen work
+    pub started: Instant,
     pub copy: Option<CopyState>,
+    /// reported agent state (herdr-style `pane report-agent`)
+    pub agent: Option<crate::api::AgentInfo>,
+    /// user label (`pane rename`)
+    pub label: Option<String>,
+    /// working directory the pane was started in
+    pub cwd: Option<String>,
 }
 
 impl Pane {
+    /// Run a vt100 operation on this pane, containing its panics (see [`contain_vt`]).
+    pub fn vt<R>(
+        &mut self,
+        scrollback: usize,
+        f: impl FnOnce(&mut vt100::Parser) -> R,
+    ) -> Option<R> {
+        let (rows, cols) = (self.rect.h, self.rect.w);
+        let r = contain_vt(&mut self.parser, rows, cols, scrollback, f);
+        if r.is_none() {
+            self.copy = None;
+        }
+        r
+    }
+
     pub fn busy(&self, cfg: &Config) -> bool {
         self.last_output.elapsed().as_secs_f32() < cfg.busy_secs
     }
@@ -69,6 +89,26 @@ impl Pane {
     }
 }
 
+/// vt100 0.16.2 can panic on wide characters at the last column after a resize. Without
+/// containment the panic would poison the server lock and every later request would fail.
+/// On panic the terminal state is reset to an empty `rows`x`cols` screen; the shell keeps running.
+pub fn contain_vt<R>(
+    parser: &mut vt100::Parser,
+    rows: u16,
+    cols: u16,
+    scrollback: usize,
+    f: impl FnOnce(&mut vt100::Parser) -> R,
+) -> Option<R> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(parser))) {
+        Ok(r) => Some(r),
+        Err(_) => {
+            crate::log!("vt100 panic contained; terminal reset to {cols}x{rows}");
+            *parser = vt100::Parser::new(rows.max(2), cols.max(2), scrollback);
+            None
+        }
+    }
+}
+
 pub struct Window {
     pub name: String,
     pub manual_name: bool,
@@ -101,11 +141,63 @@ pub enum PromptKind {
     Command,
     RenameWindow,
     RenameSession,
+    /// y/n question; `Prompt::pending` runs on `y`, anything else cancels
+    Confirm,
 }
 
 pub struct Prompt {
     pub kind: PromptKind,
+    /// input text; for `Confirm` the question shown (without the " (y/n) " suffix)
     pub buf: String,
+    /// cursor position in `buf`, in chars (0..=buf.chars().count())
+    pub cur: usize,
+    /// command line run when a `Confirm` prompt is answered `y`
+    pub pending: Option<String>,
+    /// `:` history position while browsing with Up/Down (index into `State.history`)
+    pub hist: Option<usize>,
+    /// for `Confirm`: the pane that was active when asked; `y` refuses if it changed
+    pub expect_pane: Option<usize>,
+}
+
+impl Prompt {
+    /// Text prompt with the cursor at the end.
+    pub fn new(kind: PromptKind, buf: String) -> Prompt {
+        let cur = buf.chars().count();
+        Prompt {
+            kind,
+            buf,
+            cur,
+            pending: None,
+            hist: None,
+            expect_pane: None,
+        }
+    }
+
+    /// y/n prompt that runs `command` on `y`.
+    pub fn confirm(question: String, command: String) -> Prompt {
+        Prompt {
+            kind: PromptKind::Confirm,
+            buf: question,
+            cur: 0,
+            pending: Some(command),
+            hist: None,
+            expect_pane: None,
+        }
+    }
+}
+
+/// Transient status-bar message.
+pub struct Message {
+    pub text: String,
+    pub at: Instant,
+    /// errors render with the error token and stay longer
+    pub error: bool,
+}
+
+impl Message {
+    pub fn ttl(&self) -> Duration {
+        Duration::from_secs(if self.error { 5 } else { 3 })
+    }
 }
 
 pub struct Client {
@@ -116,15 +208,19 @@ pub struct Client {
     pub prompt: Option<Prompt>,
     pub chooser: Option<usize>,
     pub popup: Option<(Vec<String>, usize)>,
-    pub message: Option<(String, Instant)>,
+    pub message: Option<Message>,
     /// mouse drag start: (pane, abs row, col), and whether we moved
     pub drag: Option<(usize, i64, u16, bool)>,
+    /// terminal capabilities reported at attach (theme resolution)
+    pub env: crate::theme::ClientEnv,
 }
 
 pub struct State {
     pub cfg: Config,
     pub bindings: BTreeMap<String, String>,
     pub buffer: Option<String>,
+    /// `:` prompt history, oldest first (max 50)
+    pub history: Vec<String>,
     pub panes: HashMap<usize, Pane>,
     pub sessions: Vec<Session>,
     pub clients: HashMap<usize, Client>,
@@ -133,7 +229,40 @@ pub struct State {
     notify: mpsc::Sender<()>,
 }
 
-type Shared = Arc<Mutex<State>>;
+/// Output within this time after spawn (shell banner, prompt) is not "unseen work".
+const ATTENTION_GRACE: Duration = Duration::from_secs(2);
+
+pub type Shared = Arc<Mutex<State>>;
+
+/// `pane-titles` policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleMode {
+    Off,
+    /// only in split, unzoomed windows, for panes at least 6 rows high that have an agent
+    /// report or a label
+    Auto,
+    /// every pane of a split, unzoomed window
+    Always,
+}
+
+/// Whether a pane gets a title row (UX-10 / ui-spec §3.4). Pure: `split` = the window has at
+/// least 2 panes, `rect_h` = the pane's layout height including the title row.
+pub fn wants_title(
+    mode: TitleMode,
+    split: bool,
+    zoomed: bool,
+    rect_h: u16,
+    has_info: bool,
+) -> bool {
+    if !split || zoomed {
+        return false;
+    }
+    match mode {
+        TitleMode::Off => false,
+        TitleMode::Always => rect_h >= 2,
+        TitleMode::Auto => rect_h >= 6 && has_info,
+    }
+}
 
 impl State {
     fn id(&mut self) -> usize {
@@ -158,38 +287,111 @@ impl State {
         }
     }
 
-    pub fn visible_rects(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
+    /// Pane rects from the layout tree, before title rows are reserved. Zoom gives the active
+    /// pane the whole area.
+    fn layout_rects(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
         let area = self.pane_area(s);
         if w.zoomed {
-            vec![(w.active, area)]
-        } else {
-            let mut v = vec![];
-            w.layout.layout(area, &mut v);
-            v
+            return vec![(w.active, area)];
+        }
+        let mut v = vec![];
+        w.layout.layout(area, &mut v);
+        v
+    }
+
+    fn title_mode(&self) -> TitleMode {
+        match self.cfg.pane_titles.as_str() {
+            "off" => TitleMode::Off,
+            "always" => TitleMode::Always,
+            _ => TitleMode::Auto,
         }
     }
 
-    fn sidx(&self, name: &str) -> Option<usize> {
+    fn pane_has_info(&self, pid: usize) -> bool {
+        self.panes
+            .get(&pid)
+            .is_some_and(|p| p.agent.is_some() || p.label.as_deref().is_some_and(|l| !l.is_empty()))
+    }
+
+    /// Panes whose layout rect starts with a title row.
+    fn titled_panes(&self, w: &Window, rects: &[(usize, Rect)]) -> Vec<usize> {
+        let mode = self.title_mode();
+        let split = w.panes().len() >= 2;
+        rects
+            .iter()
+            .filter(|(pid, r)| wants_title(mode, split, w.zoomed, r.h, self.pane_has_info(*pid)))
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
+    /// Content rects of the visible panes. A titled pane's first row is its title, so its
+    /// rect starts one row lower (PTY size and mouse hit-tests use this rect).
+    pub fn visible_rects(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
+        let rects = self.layout_rects(s, w);
+        let titled = self.titled_panes(w, &rects);
+        rects
+            .into_iter()
+            .map(|(pid, r)| {
+                if titled.contains(&pid) {
+                    (
+                        pid,
+                        Rect {
+                            y: r.y + 1,
+                            h: r.h - 1,
+                            ..r
+                        },
+                    )
+                } else {
+                    (pid, r)
+                }
+            })
+            .collect()
+    }
+
+    /// The title row of each titled pane (1 row, same columns as the pane).
+    pub fn title_rows(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
+        let rects = self.layout_rects(s, w);
+        let titled = self.titled_panes(w, &rects);
+        rects
+            .into_iter()
+            .filter(|(pid, _)| titled.contains(pid))
+            .map(|(pid, r)| (pid, Rect { h: 1, ..r }))
+            .collect()
+    }
+
+    pub(crate) fn sidx(&self, name: &str) -> Option<usize> {
         self.sessions.iter().position(|s| s.name == name)
     }
 
-    fn client_si(&self, cid: usize) -> Option<usize> {
+    pub(crate) fn client_si(&self, cid: usize) -> Option<usize> {
         self.clients.get(&cid).and_then(|c| self.sidx(&c.session))
     }
 
-    fn active_pane(&self, si: usize) -> usize {
+    pub(crate) fn active_pane(&self, si: usize) -> usize {
         let s = &self.sessions[si];
         s.windows[s.active].active
     }
 
-    fn message(&mut self, cid: usize, msg: impl Into<String>) {
+    pub(crate) fn message(&mut self, cid: usize, msg: impl Into<String>) {
+        self.set_message(cid, msg.into(), false);
+    }
+
+    pub(crate) fn error_message(&mut self, cid: usize, msg: impl Into<String>) {
+        self.set_message(cid, msg.into(), true);
+    }
+
+    fn set_message(&mut self, cid: usize, text: String, error: bool) {
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.message = Some((msg.into(), Instant::now()));
+            c.message = Some(Message {
+                text,
+                at: Instant::now(),
+                error,
+            });
         }
         self.mark_dirty();
     }
 
-    fn spawn_pane(
+    pub(crate) fn spawn_pane(
         &mut self,
         shared: &Shared,
         rows: u16,
@@ -213,10 +415,14 @@ impl State {
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("TMUXLIKE", format!("{id}"));
-        if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+        cmd.env("TMUXLIKE_PANE_ID", crate::api::pane_id_str(id));
+        cmd.env("TMUXLIKE_SOCKET", ipc::base_name());
+        let start_dir = match cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            Some(d) => Some(d.to_string()),
+            None => dirs::home_dir().map(|h| h.to_string_lossy().into_owned()),
+        };
+        if let Some(d) = &start_dir {
             cmd.cwd(d);
-        } else if let Some(h) = dirs::home_dir() {
-            cmd.cwd(h);
         }
         crate::log!("pane {id}: spawning {shell:?} {}x{}", size.cols, size.rows);
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
@@ -240,7 +446,11 @@ impl State {
             },
             last_output: Instant::now(),
             attention: false,
+            started: Instant::now(),
             copy: None,
+            agent: None,
+            label: None,
+            cwd: start_dir,
         };
         self.panes.insert(id, pane);
         let shared = shared.clone();
@@ -265,11 +475,12 @@ impl State {
                                 String::from_utf8_lossy(&buf[..n.min(300)])
                             );
                         }
-                        let mut st = shared.lock().unwrap();
+                        let mut st = crate::api::lock(&shared);
+                        let scrollback = st.cfg.scrollback;
                         let Some(p) = st.panes.get_mut(&id) else {
                             return;
                         };
-                        p.parser.process(&buf[..n]);
+                        p.vt(scrollback, |vt| vt.process(&buf[..n]));
                         // Answer terminal queries (ConPTY and many apps block waiting for these).
                         let replies = crate::keys::query_replies(
                             &buf[..n],
@@ -284,13 +495,15 @@ impl State {
                             let _ = p.writer.flush();
                         }
                         p.last_output = Instant::now();
-                        p.attention = true;
+                        if p.started.elapsed() >= ATTENTION_GRACE {
+                            p.attention = true;
+                        }
                         st.dirty = true;
                         let _ = st.notify.send(());
                     }
                 }
             }
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             st.pane_exited(id);
         });
         Ok(id)
@@ -308,7 +521,7 @@ impl State {
             .unwrap_or(first)
     }
 
-    fn new_session(
+    pub(crate) fn new_session(
         &mut self,
         shared: &Shared,
         name: Option<String>,
@@ -347,7 +560,12 @@ impl State {
         Ok(name)
     }
 
-    fn new_window(&mut self, shared: &Shared, si: usize, name: Option<String>) -> Result<()> {
+    pub(crate) fn new_window(
+        &mut self,
+        shared: &Shared,
+        si: usize,
+        name: Option<String>,
+    ) -> Result<()> {
         let area = self.pane_area(&self.sessions[si]);
         let cwd = self.sessions[si].cwd.clone();
         let id = self.spawn_pane(shared, area.h, area.w, cwd.as_deref())?;
@@ -367,27 +585,71 @@ impl State {
     }
 
     fn split(&mut self, shared: &Shared, si: usize, dir: Dir) -> Result<()> {
-        let s = &self.sessions[si];
-        let w = &s.windows[s.active];
-        let cur = self
-            .panes
-            .get(&w.active)
-            .map(|p| p.rect)
-            .unwrap_or_default();
+        let pid = self.active_pane(si);
+        self.split_pane(shared, pid, dir, None, None, true)
+            .map(|_| ())
+    }
+
+    /// Split pane `pid` (the new pane goes right/below). `ratio` = share of the existing pane.
+    /// cwd defaults to the source pane's start dir. Returns the new pane id.
+    pub(crate) fn split_pane(
+        &mut self,
+        shared: &Shared,
+        pid: usize,
+        dir: Dir,
+        ratio: Option<f32>,
+        cwd: Option<String>,
+        focus: bool,
+    ) -> Result<usize> {
+        let (si, wi) = self.locate(pid).ok_or_else(|| anyhow!("pane not found"))?;
+        let cur = self.panes.get(&pid).map(|p| p.rect).unwrap_or_default();
         let (h, wd) = if dir == Dir::H {
             (cur.h, cur.w / 2)
         } else {
             (cur.h / 2, cur.w)
         };
-        let cwd = s.cwd.clone();
+        let cwd = cwd
+            .or_else(|| self.panes.get(&pid).and_then(|p| p.cwd.clone()))
+            .or_else(|| self.sessions[si].cwd.clone());
         let id = self.spawn_pane(shared, h, wd, cwd.as_deref())?;
-        let s = &mut self.sessions[si];
-        let w = &mut s.windows[s.active];
-        w.layout.split(w.active, id, dir);
-        w.active = id;
+        let w = &mut self.sessions[si].windows[wi];
+        w.layout
+            .split_with(pid, id, dir, ratio.unwrap_or(0.5).clamp(0.05, 0.95));
         w.zoomed = false;
+        if focus {
+            self.focus_pane(id);
+        }
         self.relayout(si);
-        Ok(())
+        Ok(id)
+    }
+
+    /// Make `pid` the focused pane of its window/session and mark it seen.
+    pub(crate) fn focus_pane(&mut self, pid: usize) -> bool {
+        let Some((si, wi)) = self.locate(pid) else {
+            return false;
+        };
+        let s = &mut self.sessions[si];
+        s.active = wi;
+        s.last_used = Instant::now();
+        let w = &mut s.windows[wi];
+        if w.active != pid {
+            w.zoomed = false;
+        }
+        w.active = pid;
+        if let Some(p) = self.panes.get_mut(&pid) {
+            p.attention = false;
+        }
+        self.relayout(si);
+        true
+    }
+
+    /// Close one pane (kills its process) and clean up its window/session.
+    pub(crate) fn kill_pane(&mut self, pid: usize) -> bool {
+        if !self.panes.contains_key(&pid) {
+            return false;
+        }
+        self.pane_exited(pid);
+        true
     }
 
     pub fn relayout(&mut self, si: usize) {
@@ -396,11 +658,12 @@ impl State {
         for w in &s.windows {
             all.extend(self.visible_rects(s, w));
         }
+        let scrollback = self.cfg.scrollback;
         for (id, r) in all {
             if let Some(p) = self.panes.get_mut(&id) {
                 if p.rect != r && r.w > 0 && r.h > 0 {
                     p.rect = r;
-                    p.parser.screen_mut().set_size(r.h, r.w);
+                    p.vt(scrollback, |vt| vt.screen_mut().set_size(r.h, r.w));
                     let _ = p.master.resize(PtySize {
                         rows: r.h,
                         cols: r.w,
@@ -426,12 +689,21 @@ impl State {
         }
     }
 
-    fn mark_dirty(&mut self) {
+    /// Recompute the layout of `pid`'s session (titles may appear/disappear after an agent
+    /// report or rename, which changes the pane's rect and PTY size). Marks dirty either way.
+    pub(crate) fn relayout_pane(&mut self, pid: usize) {
+        match self.locate(pid) {
+            Some((si, _)) => self.relayout(si),
+            None => self.mark_dirty(),
+        }
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
         let _ = self.notify.send(());
     }
 
-    fn locate(&self, pid: usize) -> Option<(usize, usize)> {
+    pub(crate) fn locate(&self, pid: usize) -> Option<(usize, usize)> {
         for (si, s) in self.sessions.iter().enumerate() {
             for (wi, w) in s.windows.iter().enumerate() {
                 if w.layout.contains(pid) {
@@ -491,6 +763,15 @@ impl State {
                 let c = self.clients.get_mut(&id).unwrap();
                 c.session = o.clone();
                 c.frame.invalidate();
+                c.message = Some(Message {
+                    text: commands::session_ended_text(
+                        &crate::theme::Theme::resolve(&self.cfg.theme, &c.env),
+                        session,
+                        o,
+                    ),
+                    at: Instant::now(),
+                    error: false,
+                });
                 continue;
             }
             if let Some(mut c) = self.clients.remove(&id) {
@@ -499,7 +780,7 @@ impl State {
         }
     }
 
-    fn kill_session(&mut self, si: usize) {
+    pub(crate) fn kill_session(&mut self, si: usize) {
         let s = self.sessions.remove(si);
         for w in &s.windows {
             for pid in w.panes() {
@@ -511,7 +792,7 @@ impl State {
         self.drop_clients_of(&s.name, "session killed");
     }
 
-    fn write_pane(&mut self, pid: usize, bytes: &[u8]) {
+    pub(crate) fn write_pane(&mut self, pid: usize, bytes: &[u8]) {
         if let Some(p) = self.panes.get_mut(&pid) {
             if p.copy.is_some() {
                 p.copy = None;
@@ -523,7 +804,7 @@ impl State {
         }
     }
 
-    fn paste(&mut self, pid: usize, text: &str) {
+    pub(crate) fn paste(&mut self, pid: usize, text: &str) {
         let bp = self
             .panes
             .get(&pid)
@@ -538,7 +819,7 @@ impl State {
         self.write_pane(pid, data.as_bytes());
     }
 
-    fn set_clipboard(&mut self, cid: usize, text: String) {
+    pub(crate) fn set_clipboard(&mut self, cid: usize, text: String) {
         let n = text.chars().count();
         if self.cfg.osc52 {
             let seq = copy::osc52(&text);
@@ -550,7 +831,7 @@ impl State {
         self.message(cid, format!("copied {n} characters"));
     }
 
-    fn switch_session(&mut self, cid: usize, ni: usize) {
+    pub(crate) fn switch_session(&mut self, cid: usize, ni: usize) {
         let Some(si) = self.client_si(cid) else {
             return;
         };
@@ -614,7 +895,7 @@ impl State {
         }
     }
 
-    fn target_session(&self, target: Option<&str>) -> Result<usize, String> {
+    pub(crate) fn target_session(&self, target: Option<&str>) -> Result<usize, String> {
         match target {
             Some(t) => {
                 let name = t.split([':', '.']).next().unwrap_or(t);
@@ -651,6 +932,9 @@ impl State {
         match cmd {
             Cmd::Set(k, v) => {
                 self.cfg.set(&k, &v)?;
+                if k == "persist" && !self.cfg.persist {
+                    crate::persist::clear();
+                }
                 if k == "sidebar" {
                     let sb = self.cfg.sidebar;
                     for s in &mut self.sessions {
@@ -689,7 +973,22 @@ impl State {
                 let text = self.capture(target.as_deref())?;
                 self.buffer = Some(text);
             }
-            other => return Err(format!("{other:?}: needs an attached client")),
+            Cmd::KillSession { target: Some(t) } => {
+                let si = self.session_index_for_kill(&t)?;
+                self.kill_session(si);
+            }
+            Cmd::KillWindow { target: Some(t) } => {
+                let (si, wi) = self.window_for(None, Some(t.as_str()))?;
+                self.kill_window_at(si, wi);
+            }
+            Cmd::NextAttention { backward } => {
+                commands::headless_attention(self, backward)?;
+            }
+            Cmd::ConfirmBefore { command, .. } => {
+                // no client to ask: run the command as typed
+                self.exec_global(commands::parse(&command)?)?;
+            }
+            other => return Err(format!("\"{}\" needs an attached client", other.name())),
         }
         Ok(())
     }
@@ -714,7 +1013,7 @@ impl State {
                     _ => (PromptKind::Command, String::new()),
                 };
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    c.prompt = Some(Prompt { kind, buf });
+                    c.prompt = Some(Prompt::new(kind, buf));
                 }
             }
             Cmd::RenameWindow(Some(n)) => {
@@ -743,14 +1042,35 @@ impl State {
                 let pid = self.active_pane(si);
                 self.pane_exited(pid);
             }
-            Cmd::KillWindow => {
-                let s = &self.sessions[si];
-                for pid in s.windows[s.active].panes() {
-                    self.pane_exited(pid);
+            Cmd::KillWindow { target } => {
+                let (s, w) = self.window_for(Some(si), target.as_deref())?;
+                self.kill_window_at(s, w);
+            }
+            Cmd::KillSession { target } => {
+                let s = self.kill_session_target(si, target.as_deref())?;
+                self.kill_session(s);
+            }
+            Cmd::NextAttention { backward } => self.next_attention(cid, si, backward),
+            Cmd::ConfirmBefore { prompt, command } => {
+                if !self.cfg.confirm_close {
+                    // confirm-close off: the command runs at once, as if typed
+                    return self.exec(shared, cid, commands::parse(&command)?);
+                }
+                // the target is bound now: `y` later runs `pending`, and kill-pane also
+                // refuses when the active pane has moved (`expect_pane`)
+                let target = self.confirm_target(si, &command)?;
+                let text = match prompt {
+                    Some(p) => p,
+                    None => self.confirm_prompt_text(si, &command)?,
+                };
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    let mut p = Prompt::confirm(text, target.pending);
+                    p.expect_pane = target.expect_pane;
+                    c.prompt = Some(p);
                 }
             }
-            Cmd::KillSession => self.kill_session(si),
             Cmd::KillServer => {
+                crate::persist::clear();
                 while !self.sessions.is_empty() {
                     self.kill_session(0);
                 }
@@ -894,16 +1214,7 @@ impl State {
             }
             Cmd::DisplayMessage(m) => self.message(cid, m),
             Cmd::ListKeys => {
-                let mut lines = vec![
-                    format!(
-                        "prefix = {}   (j/k/Space scroll, q closes)",
-                        self.cfg.prefix_name()
-                    ),
-                    String::new(),
-                ];
-                for (k, c) in &self.bindings {
-                    lines.push(format!("{k:>10}  {c}"));
-                }
+                let lines = commands::key_lines(self);
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.popup = Some((lines, 0));
                 }
@@ -912,413 +1223,6 @@ impl State {
         }
         self.mark_dirty();
         Ok(())
-    }
-
-    fn run_line(&mut self, shared: &Shared, cid: usize, line: &str) {
-        if let Err(e) = commands::parse(line).and_then(|c| self.exec(shared, cid, c)) {
-            self.message(cid, e);
-        }
-    }
-
-    fn handle_event(&mut self, shared: &Shared, cid: usize, ev: Event) {
-        let Some(si) = self.client_si(cid) else {
-            return;
-        };
-        self.sessions[si].last_used = Instant::now();
-        match ev {
-            Event::Resize(cols, rows) => {
-                let s = &mut self.sessions[si];
-                s.cols = cols.max(10);
-                s.rows = rows.max(3);
-                self.relayout(si);
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.frame.invalidate();
-                }
-            }
-            Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(shared, cid, si, k),
-            Event::Paste(text) => {
-                if let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    p.buf.push_str(&text.replace(['\r', '\n'], " "));
-                    self.mark_dirty();
-                    return;
-                }
-                let pid = self.active_pane(si);
-                self.paste(pid, &text);
-            }
-            Event::Mouse(m) if self.cfg.mouse => self.handle_mouse(cid, si, m),
-            _ => {}
-        }
-    }
-
-    fn handle_mouse(&mut self, cid: usize, si: usize, m: crossterm::event::MouseEvent) {
-        let s = &self.sessions[si];
-        let w = &s.windows[s.active];
-        let rects = self.visible_rects(s, w);
-        let hit = rects
-            .iter()
-            .find(|(_, r)| r.contains(m.column, m.row))
-            .copied();
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.drag = None;
-                    if c.chooser.is_some() || c.popup.is_some() {
-                        c.chooser = None;
-                        c.popup = None;
-                        self.mark_dirty();
-                        return;
-                    }
-                }
-                if let Some((pid, r)) = hit {
-                    let s = &mut self.sessions[si];
-                    s.windows[s.active].active = pid;
-                    if let Some(p) = self.panes.get_mut(&pid) {
-                        if let Some(cs) = &mut p.copy {
-                            cs.anchor = None;
-                        }
-                        let off = p.parser.screen().scrollback();
-                        let row = copy::abs_row(m.row - r.y, off);
-                        if let Some(c) = self.clients.get_mut(&cid) {
-                            c.drag = Some((pid, row, m.column - r.x, false));
-                        }
-                    }
-                    self.mark_dirty();
-                } else if m.row == s.rows - 1 {
-                    if let Some(wi) = crate::render::status_hit(s, m.column) {
-                        self.sessions[si].active = wi;
-                        self.relayout(si);
-                    }
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                let Some((pid, row, col, _)) = self.clients.get(&cid).and_then(|c| c.drag) else {
-                    return;
-                };
-                let Some(r) = rects.iter().find(|(i, _)| *i == pid).map(|x| x.1) else {
-                    return;
-                };
-                let Some(p) = self.panes.get_mut(&pid) else {
-                    return;
-                };
-                let mut cy = m.row.clamp(r.y, r.y + r.h - 1) - r.y;
-                let cx = m.column.clamp(r.x, r.x + r.w - 1) - r.x;
-                // auto-scroll when dragging past the edges
-                let off = p.parser.screen().scrollback();
-                if m.row < r.y {
-                    p.parser.screen_mut().set_scrollback(off + 1);
-                    cy = 0;
-                } else if m.row >= r.y + r.h && off > 0 {
-                    p.parser.screen_mut().set_scrollback(off - 1);
-                }
-                let cs = p.copy.get_or_insert_with(CopyState::default);
-                cs.anchor = Some((row, col));
-                cs.line = false;
-                cs.cx = cx;
-                cs.cy = cy;
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.drag = Some((pid, row, col, true));
-                }
-                self.mark_dirty();
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let Some((pid, _, _, moved)) =
-                    self.clients.get_mut(&cid).and_then(|c| c.drag.take())
-                else {
-                    return;
-                };
-                if moved {
-                    self.copy_selection(cid, pid);
-                }
-            }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let up = m.kind == MouseEventKind::ScrollUp;
-                if let Some((pid, r)) = hit {
-                    let p = self.panes.get_mut(&pid).unwrap();
-                    if p.parser.screen().alternate_screen() {
-                        let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-                        for _ in 0..3 {
-                            let _ = p.writer.write_all(seq);
-                        }
-                        let _ = p.writer.flush();
-                    } else {
-                        let cur = p.parser.screen().scrollback();
-                        let new = if up { cur + 3 } else { cur.saturating_sub(3) };
-                        p.parser.screen_mut().set_scrollback(new);
-                        if p.parser.screen().scrollback() > 0 {
-                            p.copy.get_or_insert(CopyState {
-                                cx: 0,
-                                cy: r.h - 1,
-                                anchor: None,
-                                line: false,
-                            });
-                        } else if p.copy.as_ref().is_some_and(|c| c.anchor.is_none()) {
-                            p.copy = None;
-                        }
-                        self.mark_dirty();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn copy_selection(&mut self, cid: usize, pid: usize) {
-        let Some(p) = self.panes.get_mut(&pid) else {
-            return;
-        };
-        let Some(cs) = p.copy.clone() else { return };
-        let Some(anchor) = cs.anchor else { return };
-        let off = p.parser.screen().scrollback();
-        let cur = (copy::abs_row(cs.cy, off), cs.cx);
-        let text = copy::extract(&mut p.parser, anchor, cur, cs.line);
-        p.copy = None;
-        p.parser.screen_mut().set_scrollback(0);
-        self.set_clipboard(cid, text);
-    }
-
-    fn handle_key(&mut self, shared: &Shared, cid: usize, si: usize, k: KeyEvent) {
-        let Some(c) = self.clients.get_mut(&cid) else {
-            return;
-        };
-        // overlays first
-        if let Some((lines, off)) = &mut c.popup {
-            let max = lines.len().saturating_sub(1);
-            match k.code {
-                KeyCode::Down | KeyCode::Char('j') => *off = (*off + 1).min(max),
-                KeyCode::Up | KeyCode::Char('k') => *off = off.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => *off = (*off + 10).min(max),
-                KeyCode::PageUp => *off = off.saturating_sub(10),
-                _ => c.popup = None,
-            }
-            self.mark_dirty();
-            return;
-        }
-        if let Some(sel) = c.chooser {
-            let entries = chooser_entries(self);
-            let c = self.clients.get_mut(&cid).unwrap();
-            match k.code {
-                KeyCode::Up | KeyCode::Char('k') => c.chooser = Some(sel.saturating_sub(1)),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    c.chooser = Some((sel + 1).min(entries.len().saturating_sub(1)))
-                }
-                KeyCode::Enter => {
-                    c.chooser = None;
-                    if let Some(&(nsi, wi)) = entries.get(sel) {
-                        self.switch_session(cid, nsi);
-                        if let Some(wi) = wi {
-                            self.sessions[nsi].active = wi;
-                            self.relayout(nsi);
-                        }
-                    }
-                }
-                KeyCode::Char('x') => {
-                    c.chooser = None;
-                    if let Some(&(nsi, wi)) = entries.get(sel) {
-                        match wi {
-                            Some(wi) => {
-                                for pid in self.sessions[nsi].windows[wi].panes() {
-                                    self.pane_exited(pid);
-                                }
-                            }
-                            None => self.kill_session(nsi),
-                        }
-                    }
-                }
-                _ => c.chooser = None,
-            }
-            self.mark_dirty();
-            return;
-        }
-        if let Some(p) = &mut c.prompt {
-            match k.code {
-                KeyCode::Enter => {
-                    let p = c.prompt.take().unwrap();
-                    let line = match p.kind {
-                        PromptKind::Command => p.buf,
-                        PromptKind::RenameWindow => {
-                            format!("rename-window \"{}\"", p.buf.replace('"', "\\\""))
-                        }
-                        PromptKind::RenameSession => {
-                            format!("rename-session \"{}\"", p.buf.replace('"', "\\\""))
-                        }
-                    };
-                    if !line.trim().is_empty() {
-                        self.run_line(shared, cid, &line);
-                    }
-                }
-                KeyCode::Esc => c.prompt = None,
-                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    c.prompt = None
-                }
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.clear(),
-                KeyCode::Backspace => {
-                    p.buf.pop();
-                }
-                KeyCode::Char(ch) if !k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.push(ch),
-                _ => {}
-            }
-            self.mark_dirty();
-            return;
-        }
-        if c.prefix {
-            c.prefix = false;
-            self.mark_dirty();
-            if self.cfg.is_prefix(&k) {
-                let _ = self.exec(shared, cid, Cmd::SendPrefix);
-                return;
-            }
-            let Some(name) = key_name(&k) else { return };
-            match self.bindings.get(&name).cloned() {
-                Some(line) => self.run_line(shared, cid, &line),
-                None => {}
-            }
-            return;
-        }
-        if self.cfg.is_prefix(&k) {
-            c.prefix = true;
-            self.mark_dirty();
-            return;
-        }
-        let pid = self.active_pane(si);
-        if self.panes.get(&pid).is_some_and(|p| p.copy.is_some()) {
-            self.copy_key(cid, pid, k);
-            return;
-        }
-        let Some(p) = self.panes.get_mut(&pid) else {
-            return;
-        };
-        let app = p.parser.screen().application_cursor();
-        let b = keys::encode(&k, app);
-        self.write_pane(pid, &b);
-    }
-
-    #[allow(unused_assignments)]
-    fn copy_key(&mut self, cid: usize, pid: usize, k: KeyEvent) {
-        let Some(p) = self.panes.get_mut(&pid) else {
-            return;
-        };
-        let (h, w) = (p.rect.h, p.rect.w);
-        let mut off = p.parser.screen().scrollback();
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let mut cs = p.copy.clone().unwrap();
-        let scroll_to = |n: usize, parser: &mut vt100::Parser| -> usize {
-            parser.screen_mut().set_scrollback(n);
-            parser.screen().scrollback()
-        };
-        let row_text = |parser: &vt100::Parser, y: u16| -> String {
-            (0..w)
-                .map(|x| {
-                    parser
-                        .screen()
-                        .cell(y, x)
-                        .map(|c| c.contents().to_string())
-                        .unwrap_or_default()
-                })
-                .map(|s| if s.is_empty() { " ".into() } else { s })
-                .collect()
-        };
-        let mut done = false;
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc
-                if cs.anchor.is_none() || k.code == KeyCode::Char('q') =>
-            {
-                done = true
-            }
-            KeyCode::Esc => cs.anchor = None,
-            KeyCode::Char('c') if ctrl => done = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                if cs.cy > 0 {
-                    cs.cy -= 1
-                } else {
-                    off = scroll_to(off + 1, &mut p.parser)
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if cs.cy + 1 < h {
-                    cs.cy += 1
-                } else if off > 0 {
-                    off = scroll_to(off - 1, &mut p.parser)
-                }
-            }
-            KeyCode::Left | KeyCode::Char('h') => cs.cx = cs.cx.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => cs.cx = (cs.cx + 1).min(w - 1),
-            KeyCode::Char('0') | KeyCode::Home => cs.cx = 0,
-            KeyCode::Char('$') | KeyCode::End => {
-                cs.cx =
-                    (row_text(&p.parser, cs.cy).trim_end().chars().count() as u16).saturating_sub(1)
-            }
-            KeyCode::Char('w') => {
-                let t: Vec<char> = row_text(&p.parser, cs.cy).chars().collect();
-                let mut x = cs.cx as usize;
-                while x < t.len() && !t[x].is_whitespace() {
-                    x += 1;
-                }
-                while x < t.len() && t[x].is_whitespace() {
-                    x += 1;
-                }
-                cs.cx = (x.min(t.len().saturating_sub(1))) as u16;
-            }
-            KeyCode::Char('b') if !ctrl => {
-                let t: Vec<char> = row_text(&p.parser, cs.cy).chars().collect();
-                let mut x = cs.cx as usize;
-                while x > 0 && t.get(x - 1).is_some_and(|c| c.is_whitespace()) {
-                    x -= 1;
-                }
-                while x > 0 && t.get(x - 1).is_some_and(|c| !c.is_whitespace()) {
-                    x -= 1;
-                }
-                cs.cx = x as u16;
-            }
-            KeyCode::PageUp | KeyCode::Char('b') => {
-                off = scroll_to(off + h as usize, &mut p.parser)
-            }
-            KeyCode::PageDown | KeyCode::Char('f') => {
-                off = scroll_to(off.saturating_sub(h as usize), &mut p.parser)
-            }
-            KeyCode::Char('u') => off = scroll_to(off + h as usize / 2, &mut p.parser),
-            KeyCode::Char('d') => {
-                off = scroll_to(off.saturating_sub(h as usize / 2), &mut p.parser)
-            }
-            KeyCode::Char('g') => {
-                off = scroll_to(usize::MAX, &mut p.parser);
-                cs.cy = 0;
-            }
-            KeyCode::Char('G') => {
-                off = scroll_to(0, &mut p.parser);
-                cs.cy = h - 1;
-            }
-            KeyCode::Char('H') => cs.cy = 0,
-            KeyCode::Char('L') => cs.cy = h - 1,
-            KeyCode::Char('v') | KeyCode::Char(' ') => {
-                cs.line = false;
-                cs.anchor = if cs.anchor.is_some() && !cs.line {
-                    None
-                } else {
-                    Some((copy::abs_row(cs.cy, off), cs.cx))
-                };
-            }
-            KeyCode::Char('V') => {
-                cs.line = true;
-                cs.anchor = Some((copy::abs_row(cs.cy, off), cs.cx));
-            }
-            KeyCode::Char('y') | KeyCode::Enter => {
-                if cs.anchor.is_some() {
-                    p.copy = Some(cs);
-                    self.copy_selection(cid, pid);
-                    self.mark_dirty();
-                    return;
-                }
-                done = true;
-            }
-            _ => {}
-        }
-        if done {
-            p.copy = None;
-            p.parser.screen_mut().set_scrollback(0);
-        } else {
-            p.copy = Some(cs);
-        }
-        self.mark_dirty();
     }
 }
 
@@ -1329,7 +1233,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
     };
     match cmd {
         Command::List => {
-            let st = shared.lock().unwrap();
+            let st = crate::api::lock(&shared);
             let mut out = String::new();
             for s in &st.sessions {
                 let n = st.clients.values().filter(|c| c.session == s.name).count();
@@ -1345,7 +1249,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             let _ = write_msg(&mut w, &ServerMsg::Text(out));
         }
         Command::Kill { session } => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             match st.sidx(&session) {
                 Some(si) => {
                     st.kill_session(si);
@@ -1360,34 +1264,42 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             }
         }
         Command::KillServer => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
+            // under the lock so the render tick cannot autosave it back before exit
+            crate::persist::clear();
             while !st.sessions.is_empty() {
                 st.kill_session(0);
             }
             let _ = write_msg(&mut w, &ServerMsg::Text(String::new()));
             std::process::exit(0);
         }
+        Command::Api(req) => {
+            let stop = matches!(req, crate::api::Request::ServerStop);
+            // handlers lock `shared` themselves so waits can release it between polls
+            let reply = crate::api::handle(&shared, req);
+            let _ = write_msg(&mut w, &ServerMsg::Api(reply));
+            if stop {
+                // the state file was saved by the handler; pane processes do not survive
+                let mut st = crate::api::lock(&shared);
+                while !st.sessions.is_empty() {
+                    st.kill_session(0);
+                }
+                std::process::exit(0);
+            }
+        }
         Command::Run { line } => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             let res = commands::parse(&line).and_then(|c| match c {
                 Cmd::CapturePane {
                     target,
                     print: true,
                 } => st.capture(target.as_deref()),
-                Cmd::DebugFrame { target } => {
-                    let si = st.target_session(target.as_deref())?;
-                    let mut c = Client {
-                        session: st.sessions[si].name.clone(),
-                        sender: Box::new(std::io::sink()),
-                        prefix: false,
-                        frame: Frame::default(),
-                        prompt: None,
-                        chooser: None,
-                        popup: None,
-                        message: None,
-                        drag: None,
-                    };
-                    Ok(render_client(&st, &mut c).unwrap_or_default())
+                Cmd::DebugFrame { target, opts } => {
+                    commands::debug_frame(&mut st, target.as_deref(), &opts)
+                }
+                // headless: the CLI gets the chosen pane on its own line
+                Cmd::NextAttention { backward } => {
+                    commands::headless_attention(&mut st, backward).map(|t| format!("{t}\n"))
                 }
                 c => st.exec_global(c).map(|_| String::new()),
             });
@@ -1404,8 +1316,9 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             rows,
             cwd,
             detached,
+            env,
         } => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             let name = match session {
                 Some(n) if st.sidx(&n).is_some() && !create => Ok(n),
                 Some(n) if !create => Err(anyhow!("can't find session: {n}")),
@@ -1448,20 +1361,25 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                     popup: None,
                     message: None,
                     drag: None,
+                    env,
                 },
             );
+            let first = commands::first_attach();
+            if first && st.cfg.hints {
+                commands::attach_hint(&mut st, cid);
+            }
             st.mark_dirty();
             drop(st);
             while let Ok(msg) = read_msg::<ClientMsg>(&mut r) {
                 if let ClientMsg::Event(ev) = msg {
-                    let mut st = shared.lock().unwrap();
+                    let mut st = crate::api::lock(&shared);
                     if !st.clients.contains_key(&cid) {
                         break;
                     }
                     st.handle_event(&shared, cid, ev);
                 }
             }
-            shared.lock().unwrap().clients.remove(&cid);
+            crate::api::lock(&shared).clients.remove(&cid);
         }
     }
 }
@@ -1476,6 +1394,7 @@ pub fn run() -> Result<()> {
         cfg,
         bindings,
         buffer: None,
+        history: Vec::new(),
         panes: HashMap::new(),
         sessions: vec![],
         clients: HashMap::new(),
@@ -1484,9 +1403,15 @@ pub fn run() -> Result<()> {
         notify: tx,
     }));
     {
-        let mut st = shared.lock().unwrap();
+        let mut st = crate::api::lock(&shared);
         for c in st.cfg.commands.clone() {
             let _ = commands::parse(&c).and_then(|cmd| st.exec_global(cmd));
+        }
+    }
+    if crate::api::lock(&shared).cfg.persist {
+        match crate::persist::restore_on_start(&shared) {
+            Ok(n) => crate::log!("restored {n} sessions"),
+            Err(e) => crate::log!("restore failed: {e}"),
         }
     }
 
@@ -1495,11 +1420,12 @@ pub fn run() -> Result<()> {
     std::thread::spawn(move || {
         let mut ever_had_session = false;
         let mut last_tick = Instant::now();
+        let mut last_saved: Option<String> = None;
         loop {
             let _ = rx.recv_timeout(Duration::from_millis(500));
             std::thread::sleep(Duration::from_millis(8));
             while rx.try_recv().is_ok() {}
-            let mut st = sh.lock().unwrap();
+            let mut st = crate::api::lock(&sh);
             let tick = last_tick.elapsed() > Duration::from_millis(500);
             if tick {
                 last_tick = Instant::now();
@@ -1537,11 +1463,11 @@ pub fn run() -> Result<()> {
                         }
                     }
                 }
+                if st.cfg.persist {
+                    crate::persist::autosave(&st, &mut last_saved);
+                }
                 for c in st.clients.values_mut() {
-                    if c.message
-                        .as_ref()
-                        .is_some_and(|m| m.1.elapsed() > Duration::from_secs(3))
-                    {
+                    if c.message.as_ref().is_some_and(|m| m.at.elapsed() > m.ttl()) {
                         c.message = None;
                     }
                 }
@@ -1549,6 +1475,10 @@ pub fn run() -> Result<()> {
             if !st.sessions.is_empty() {
                 ever_had_session = true;
             } else if ever_had_session {
+                // every session was closed by the user: nothing to restore next time
+                if st.cfg.persist {
+                    crate::persist::clear();
+                }
                 std::process::exit(0);
             }
             if !st.dirty && !tick {
@@ -1592,4 +1522,58 @@ pub fn run() -> Result<()> {
         std::thread::spawn(move || handle_conn(sh, id, conn));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TitleMode, contain_vt, wants_title};
+
+    #[test]
+    fn title_policy_auto_needs_split_height_and_info() {
+        // auto: split, unzoomed, >= 6 rows, and an agent report or label
+        assert!(wants_title(TitleMode::Auto, true, false, 6, true));
+        assert!(
+            !wants_title(TitleMode::Auto, true, false, 5, true),
+            "too short"
+        );
+        assert!(
+            !wants_title(TitleMode::Auto, true, false, 20, false),
+            "plain pane"
+        );
+        assert!(
+            !wants_title(TitleMode::Auto, false, false, 20, true),
+            "single pane"
+        );
+        assert!(
+            !wants_title(TitleMode::Auto, true, true, 20, true),
+            "zoomed"
+        );
+    }
+
+    #[test]
+    fn title_policy_always_and_off() {
+        assert!(wants_title(TitleMode::Always, true, false, 2, false));
+        assert!(
+            !wants_title(TitleMode::Always, true, false, 1, true),
+            "no room for content"
+        );
+        assert!(!wants_title(TitleMode::Always, false, false, 20, true));
+        assert!(!wants_title(TitleMode::Off, true, false, 20, true));
+    }
+
+    #[test]
+    fn vt100_wide_char_resize_panic_is_contained() {
+        let mut p = vt100::Parser::new(5, 4, 0);
+        p.process("中中中中".as_bytes());
+        p.screen_mut().set_size(5, 3);
+        let r = contain_vt(&mut p, 5, 3, 0, |vt| vt.process("x中y".as_bytes()));
+        assert!(
+            r.is_none(),
+            "vt100 no longer panics here; the guard can be revisited"
+        );
+        assert_eq!(p.screen().size(), (5, 3));
+        p.process(b"ok");
+        assert!(p.screen().contents().contains("ok"));
+        assert_eq!(contain_vt(&mut p, 5, 3, 0, |_| 7), Some(7));
+    }
 }

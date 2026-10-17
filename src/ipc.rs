@@ -4,7 +4,7 @@ use interprocess::local_socket::{
 };
 use std::io;
 
-fn base_name() -> String {
+pub fn base_name() -> String {
     if let Ok(s) = std::env::var("TMUXLIKE_SOCKET") {
         return s;
     }

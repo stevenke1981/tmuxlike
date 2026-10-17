@@ -28,6 +28,16 @@ pub struct Config {
     pub unbind: Vec<String>,
     /// Commands run after the config is loaded
     pub commands: Vec<String>,
+    /// Save the layout to a state file and restore it when the server restarts
+    pub persist: bool,
+    /// Show key hints (status-bar help, which-key bar, first-attach tip)
+    pub hints: bool,
+    /// Ask y/n before interactive kill-pane / kill-window / chooser kill
+    pub confirm_close: bool,
+    /// Pane title rows: off | auto | always
+    pub pane_titles: String,
+    /// Colors and glyphs (`[theme]` table)
+    pub theme: crate::theme::ThemeCfg,
 }
 
 impl Default for Config {
@@ -45,6 +55,11 @@ impl Default for Config {
             bind: BTreeMap::new(),
             unbind: vec![],
             commands: vec![],
+            persist: true,
+            hints: true,
+            confirm_close: true,
+            pane_titles: "auto".into(),
+            theme: crate::theme::ThemeCfg::default(),
         }
     }
 }
@@ -143,6 +158,27 @@ impl Config {
             "busy-secs" => self.busy_secs = num(val)? as f32,
             "automatic-rename" => self.automatic_rename = parse_bool(val)?,
             "osc52" | "set-clipboard" => self.osc52 = parse_bool(val)?,
+            "persist" => self.persist = parse_bool(val)?,
+            "hints" => self.hints = parse_bool(val)?,
+            "confirm-close" => self.confirm_close = parse_bool(val)?,
+            "pane-titles" => match val {
+                "off" | "auto" | "always" => self.pane_titles = val.to_string(),
+                _ => return Err(format!("pane-titles: expected off|auto|always, got {val}")),
+            },
+            "theme" | "theme-preset" => match val {
+                "terminal" | "dark" | "light" | "mono" => self.theme.preset = val.to_string(),
+                _ => {
+                    return Err(format!(
+                        "theme: expected terminal|dark|light|mono, got {val}"
+                    ));
+                }
+            },
+            "ascii-glyphs" => match val {
+                "auto" | "true" | "false" | "on" | "off" => {
+                    self.theme.ascii_glyphs = val.to_string()
+                }
+                _ => return Err(format!("ascii-glyphs: expected auto|on|off, got {val}")),
+            },
             other => return Err(format!("unknown option: {other}")),
         }
         Ok(())
