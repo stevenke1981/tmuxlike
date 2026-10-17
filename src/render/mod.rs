@@ -5,6 +5,7 @@
 mod overlay;
 mod panes;
 mod sidebar;
+pub use sidebar::{SidebarKind, sidebar_rows, sidebar_text_width};
 mod status;
 
 pub use overlay::chooser_entries;

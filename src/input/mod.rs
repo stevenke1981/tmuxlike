@@ -41,7 +41,11 @@ impl State {
                 let pid = self.active_pane(si);
                 self.paste(pid, &text);
             }
-            Event::Mouse(m) if self.cfg.mouse => self.handle_mouse(cid, si, m),
+            Event::Mouse(m) if self.cfg.mouse => {
+                if let Some(line) = self.handle_mouse(cid, si, m) {
+                    self.run_line(shared, cid, &line);
+                }
+            }
             _ => {}
         }
     }
