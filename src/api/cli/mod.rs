@@ -16,54 +16,14 @@ use scan::{flag, no_opts, scan};
 /// Top-level words routed to this parser by `main.rs`.
 pub const API_COMMANDS: &[&str] = &["pane", "agent", "api", "session", "server"];
 
-/// Usage text for the API commands (printed by `tmuxlike <group> --help`).
-pub const HELP: &str = r#"tmuxlike pane|agent|api|session|server  (herdr-style JSON automation)
-
-Pane ids: p<N> (tmux-style %<N> also accepted). Pane TARGET is one of:
-  <id>  |  --pane ID  |  --current   (--current = $TMUXLIKE_PANE_ID inside a pane)
-Omitted pane targets use the caller's pane ($TMUXLIKE_PANE_ID) when set, else the focused
-pane of the most recently used session.
-Output: success prints {"result": ...} on stdout, exit 0; text replies print raw.
-Errors print {"error":{"code","message"}} on stderr, exit 1. Usage errors exit 2.
-Use -- before text that starts with '-'. Use --opt=value to pass values starting with '--'.
-
-api snapshot
-session list [--json]
-server stop
-pane list [--session NAME]
-pane get <id>
-pane current [--pane ID | --current]
-pane split [TARGET] --direction right|down [--ratio F] [--cwd PATH] [--focus | --no-focus]
-pane focus <id>
-pane focus --direction left|right|up|down [--pane ID | --current]
-pane zoom [TARGET] [--toggle | --on | --off]
-pane rename <id> <label>  |  pane rename <id> --clear
-pane close <id>
-pane read <id> [--source visible|recent] [--lines N]
-pane send-text <id> <text>        (no Enter is added)
-pane send-keys <id> <key>...      (e.g. Enter C-c Up)
-pane run <id> <command>           (command + Enter)
-pane wait-output <id> (--match TEXT | --regex PAT) [--source S] [--lines N] [--timeout MS]
-pane report-agent <id> --source ID --agent LABEL --state idle|working|blocked|unknown
-                  [--message TEXT] [--seq N] [-- RESUME_CMD...]
-pane release-agent <id> --source ID --agent LABEL [--seq N]
-agent list
-agent get <target>
-agent read <target> [--source visible|recent] [--lines N]
-agent send-keys <target> <key>...
-agent focus <target>
-agent prompt <target> <text> [--wait [--until S]... [--timeout MS]]
-agent wait <target> [--until S]... [--timeout MS]
-agent rename <target> <name>  |  agent rename <target> --clear
-
-<target> = pane id or agent name [a-z][a-z0-9_-]{0,31} (a name may not look like a pane id, e.g. p1).
---until S: idle|working|blocked|done|unknown; repeatable (default: idle, done, blocked).
---timeout MS: milliseconds; omitted = wait without limit."#;
+/// Sentinel error returned for every help request (`pane --help`, `pane` alone, ...). The
+/// usage text itself is the `cli.api_help` catalog entry; `main.rs` prints it in the CLI language.
+pub const HELP: &str = "__help__";
 
 /// Parse `args` (starting at the group word, e.g. `["pane", "list"]`).
 /// `current` is the caller's pane id from `$TMUXLIKE_PANE_ID`, used by `--current` and as the
-/// fallback for omitted pane targets. Err = usage error message (CLI exits with status 2);
-/// every help request returns `HELP` exactly.
+/// fallback for omitted pane targets. Err = usage error message (CLI exits with status 2), or
+/// `HELP` exactly for every help request.
 pub fn parse(args: &[String], current: Option<usize>) -> Result<Request, String> {
     let [group, sub, rest @ ..] = args else {
         return Err(HELP.to_string());

@@ -27,52 +27,8 @@ mod render;
 mod server;
 mod theme;
 
+use i18n::tr;
 use proto::Command;
-
-const HELP: &str = "tmuxlike - a cross-platform terminal multiplexer
-
-USAGE:
-  tmuxlike                       attach to the last session, or create one
-  tmuxlike new [-d] [-s NAME]    create a new session and attach (-d: in background)
-  tmuxlike attach [-t NAME]      attach to an existing session (alias: a)
-  tmuxlike ls                    list sessions
-  tmuxlike kill-session -t NAME  kill a session
-  tmuxlike kill-server           kill the server and all sessions
-  tmuxlike keys                  show default key bindings
-  tmuxlike capture-pane -p [-t S] print the active pane of a session
-  tmuxlike send-keys [-t S] KEYS  type text / keys (Enter, C-c, ...) into it
-  tmuxlike source-file [PATH]    reload config in the running server
-  tmuxlike <command> [args]      run any server command, e.g. `tmuxlike set mouse off`
-
-AUTOMATION (herdr-style, JSON output; see `tmuxlike pane --help`):
-  tmuxlike pane list|get|split|read|send-text|send-keys|run|wait-output|...
-  tmuxlike agent list|get|read|prompt|wait|rename|focus|send-keys
-  tmuxlike session list   tmuxlike api snapshot   tmuxlike server [stop]
-
-Config: $TMUXLIKE_CONFIG or <config_dir>/tmuxlike/config.toml";
-
-const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
-  c          new window           n / p      next / previous window
-  0-9        select window        %  or |    split left/right
-  \"  or -     split top/bottom     arrows/hjkl move focus
-  Ctrl/Alt+arrows, H J K L  resize pane
-  o          next pane            z          zoom pane
-  x          kill pane (y/n)      &          kill window (y/n)
-  Tab        next pane needing you (blocked first, then done)
-  BTab       previous such pane   g          tree chooser (like s / w)
-  [ / PgUp   copy mode (hjkl, v/V select, y copy, q exit)
-  ]          paste buffer         :          command prompt
-  ,          rename window        $          rename session
-  s / w      session chooser      ( )        prev/next session
-  a  or b    toggle sidebar       r          reload config
-  ?          list keys            d          detach
-  Ctrl-b     send prefix to the program
-Options (`set NAME VALUE` or config.toml):
-  hints on|off            status-bar key hints and the first-attach tip (default on)
-  confirm-close on|off    y/n before x and & (default on; off = kill at once)
-  pane-titles off|auto|always  title row per pane (auto: split window + agent/label)
-Mouse: click a pane or its title to focus, a window label to switch, the session chip for
-the chooser, the counters for the next alert, a sidebar row to jump; wheel scrolls; drag copies.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
 
 fn flag(args: &[String], f: &str) -> Option<String> {
     args.iter()
@@ -83,6 +39,7 @@ fn flag(args: &[String], f: &str) -> Option<String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    let lang = client::lang();
     let res = match sub {
         "__server" => server::run(),
         "server" if args.len() == 1 => server::run(),
@@ -96,7 +53,7 @@ fn main() {
                     Err(e) => Err(e),
                 },
                 Err(help) if help == api::cli::HELP => {
-                    println!("{help}");
+                    println!("{}", tr(lang, "cli.api_help"));
                     Ok(())
                 }
                 Err(usage) => {
@@ -118,7 +75,7 @@ fn main() {
         },
         "kill-server" => client::simple(Command::KillServer),
         "keys" | "list-keys" => {
-            println!("{KEYS}");
+            println!("{}", tr(lang, "cli.keys"));
             Ok(())
         }
         "-V" | "--version" | "version" => {
@@ -126,7 +83,7 @@ fn main() {
             Ok(())
         }
         "-h" | "--help" | "help" => {
-            println!("{HELP}");
+            println!("{}", tr(lang, "cli.help"));
             Ok(())
         }
         _ => {
@@ -144,12 +101,128 @@ fn main() {
                 .join(" ");
             match commands::parse(&line) {
                 Ok(_) => client::simple(Command::Run { line }),
-                Err(e) => Err(anyhow::anyhow!("{e}\n\n{HELP}")),
+                Err(e) => Err(anyhow::anyhow!("{e}\n\n{}", tr(lang, "cli.help"))),
             }
         }
     };
     if let Err(e) = res {
         eprintln!("tmuxlike: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::{Lang, tr};
+
+    const HELP_KEYS: [&str; 3] = ["cli.help", "cli.keys", "cli.api_help"];
+
+    /// Command, option and key names that the help texts must keep in zh-TW.
+    const NAMES: [&str; 14] = [
+        "kill-server",
+        "kill-session",
+        "send-keys",
+        "capture-pane",
+        "source-file",
+        "bind-key",
+        "send-text",
+        "wait-output",
+        "report-agent",
+        "release-agent",
+        "pane-titles",
+        "confirm-close",
+        "Ctrl-b",
+        "--until",
+    ];
+
+    /// Flags such as `-d`, `-t`, `--direction`: tokens that start with `-` and a letter.
+    fn flags(text: &str) -> Vec<&str> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .filter(|w| {
+                w.starts_with('-')
+                    && w.trim_start_matches('-')
+                        .starts_with(|c: char| c.is_ascii_alphabetic())
+            })
+            .collect()
+    }
+
+    /// Usage lines (`tmuxlike new [-d] [-s NAME]`, `pane split [TARGET] ...`): the command
+    /// words (`tmuxlike new`, `pane split`) are never translated. The first line is a title;
+    /// prose lines (ending in a period) are not usage lines.
+    fn usage_heads(text: &str) -> Vec<String> {
+        const GROUPS: [&str; 6] = [
+            "tmuxlike ",
+            "pane ",
+            "agent ",
+            "api ",
+            "session ",
+            "server ",
+        ];
+        text.lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|l| !l.ends_with('.') && GROUPS.iter().any(|g| l.starts_with(g)))
+            .map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    #[test]
+    fn help_and_keys_are_non_empty_and_translated() {
+        for key in HELP_KEYS {
+            let (en, zh) = (tr(Lang::En, key), tr(Lang::ZhTw, key));
+            assert!(!en.is_empty() && !zh.is_empty(), "{key}: empty text");
+            assert_ne!(en, zh, "{key}: zh-TW equals English");
+        }
+    }
+
+    #[test]
+    fn english_help_keeps_its_original_first_lines() {
+        assert!(
+            tr(Lang::En, "cli.help")
+                .starts_with("tmuxlike - a cross-platform terminal multiplexer")
+        );
+        assert!(tr(Lang::En, "cli.keys").starts_with("Prefix: Ctrl-b (configurable), then:"));
+        assert!(
+            tr(Lang::En, "cli.api_help")
+                .starts_with("tmuxlike pane|agent|api|session|server  (herdr-style")
+        );
+    }
+
+    #[test]
+    fn zh_tw_help_uses_glossary_terms() {
+        let main_help = tr(Lang::ZhTw, "cli.help");
+        assert!(main_help.contains("工作階段") && main_help.contains("窗格"));
+        let api_help = tr(Lang::ZhTw, "cli.api_help");
+        assert!(api_help.contains("工作階段") && api_help.contains("窗格"));
+        assert!(tr(Lang::ZhTw, "cli.keys").contains("窗格"));
+    }
+
+    #[test]
+    fn command_names_and_flags_survive_translation() {
+        for key in HELP_KEYS {
+            let (en, zh) = (tr(Lang::En, key), tr(Lang::ZhTw, key));
+            for head in usage_heads(en) {
+                assert!(
+                    zh.contains(head.as_str()),
+                    "{key}: zh-TW lost usage '{head}'"
+                );
+            }
+            for flag in flags(en) {
+                assert!(zh.contains(flag), "{key}: zh-TW lost flag '{flag}'");
+            }
+        }
+    }
+
+    #[test]
+    fn named_commands_and_keys_survive_translation() {
+        let all_en: String = HELP_KEYS.iter().map(|k| tr(Lang::En, k)).collect();
+        let all_zh: String = HELP_KEYS.iter().map(|k| tr(Lang::ZhTw, k)).collect();
+        for name in NAMES {
+            assert!(all_en.contains(name), "{name} is not in the English help");
+            assert!(all_zh.contains(name), "zh-TW lost {name}");
+        }
+        assert!(
+            tr(Lang::ZhTw, "cli.api_help").contains("pane split [TARGET] --direction right|down")
+        );
     }
 }
