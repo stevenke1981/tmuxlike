@@ -260,6 +260,9 @@ pub type ApiResult = Result<Reply, ApiError>;
 /// Poll period for every wait; the server lock is never held while sleeping.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// `AgentInfo::source` of agents rebuilt from the state file after a server restart.
+pub const RESTORE_SOURCE: &str = "restore";
+
 /// Max chars for labels, agent labels, messages and other display text.
 pub const LABEL_MAX: usize = 80;
 

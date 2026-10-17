@@ -38,6 +38,20 @@ pub struct Pane {
 }
 
 impl Pane {
+    /// Run a vt100 operation on this pane, containing its panics (see [`contain_vt`]).
+    pub fn vt<R>(
+        &mut self,
+        scrollback: usize,
+        f: impl FnOnce(&mut vt100::Parser) -> R,
+    ) -> Option<R> {
+        let (rows, cols) = (self.rect.h, self.rect.w);
+        let r = contain_vt(&mut self.parser, rows, cols, scrollback, f);
+        if r.is_none() {
+            self.copy = None;
+        }
+        r
+    }
+
     pub fn busy(&self, cfg: &Config) -> bool {
         self.last_output.elapsed().as_secs_f32() < cfg.busy_secs
     }
@@ -72,6 +86,26 @@ impl Pane {
         }
         #[cfg(not(unix))]
         {
+            None
+        }
+    }
+}
+
+/// vt100 0.16.2 can panic on wide characters at the last column after a resize. Without
+/// containment the panic would poison the server lock and every later request would fail.
+/// On panic the terminal state is reset to an empty `rows`x`cols` screen; the shell keeps running.
+pub fn contain_vt<R>(
+    parser: &mut vt100::Parser,
+    rows: u16,
+    cols: u16,
+    scrollback: usize,
+    f: impl FnOnce(&mut vt100::Parser) -> R,
+) -> Option<R> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(parser))) {
+        Ok(r) => Some(r),
+        Err(_) => {
+            crate::log!("vt100 panic contained; terminal reset to {cols}x{rows}");
+            *parser = vt100::Parser::new(rows.max(2), cols.max(2), scrollback);
             None
         }
     }
@@ -284,11 +318,12 @@ impl State {
                                 String::from_utf8_lossy(&buf[..n.min(300)])
                             );
                         }
-                        let mut st = shared.lock().unwrap();
+                        let mut st = crate::api::lock(&shared);
+                        let scrollback = st.cfg.scrollback;
                         let Some(p) = st.panes.get_mut(&id) else {
                             return;
                         };
-                        p.parser.process(&buf[..n]);
+                        p.vt(scrollback, |vt| vt.process(&buf[..n]));
                         // Answer terminal queries (ConPTY and many apps block waiting for these).
                         let replies = crate::keys::query_replies(
                             &buf[..n],
@@ -311,7 +346,7 @@ impl State {
                     }
                 }
             }
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             st.pane_exited(id);
         });
         Ok(id)
@@ -466,11 +501,12 @@ impl State {
         for w in &s.windows {
             all.extend(self.visible_rects(s, w));
         }
+        let scrollback = self.cfg.scrollback;
         for (id, r) in all {
             if let Some(p) = self.panes.get_mut(&id) {
                 if p.rect != r && r.w > 0 && r.h > 0 {
                     p.rect = r;
-                    p.parser.screen_mut().set_size(r.h, r.w);
+                    p.vt(scrollback, |vt| vt.screen_mut().set_size(r.h, r.w));
                     let _ = p.master.resize(PtySize {
                         rows: r.h,
                         cols: r.w,
@@ -1403,7 +1439,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
     };
     match cmd {
         Command::List => {
-            let st = shared.lock().unwrap();
+            let st = crate::api::lock(&shared);
             let mut out = String::new();
             for s in &st.sessions {
                 let n = st.clients.values().filter(|c| c.session == s.name).count();
@@ -1419,7 +1455,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             let _ = write_msg(&mut w, &ServerMsg::Text(out));
         }
         Command::Kill { session } => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             match st.sidx(&session) {
                 Some(si) => {
                     st.kill_session(si);
@@ -1434,7 +1470,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             }
         }
         Command::KillServer => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             // under the lock so the render tick cannot autosave it back before exit
             crate::persist::clear();
             while !st.sessions.is_empty() {
@@ -1450,7 +1486,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             let _ = write_msg(&mut w, &ServerMsg::Api(reply));
             if stop {
                 // the state file was saved by the handler; pane processes do not survive
-                let mut st = shared.lock().unwrap();
+                let mut st = crate::api::lock(&shared);
                 while !st.sessions.is_empty() {
                     st.kill_session(0);
                 }
@@ -1458,7 +1494,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             }
         }
         Command::Run { line } => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             let res = commands::parse(&line).and_then(|c| match c {
                 Cmd::CapturePane {
                     target,
@@ -1495,7 +1531,7 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             cwd,
             detached,
         } => {
-            let mut st = shared.lock().unwrap();
+            let mut st = crate::api::lock(&shared);
             let name = match session {
                 Some(n) if st.sidx(&n).is_some() && !create => Ok(n),
                 Some(n) if !create => Err(anyhow!("can't find session: {n}")),
@@ -1544,14 +1580,14 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             drop(st);
             while let Ok(msg) = read_msg::<ClientMsg>(&mut r) {
                 if let ClientMsg::Event(ev) = msg {
-                    let mut st = shared.lock().unwrap();
+                    let mut st = crate::api::lock(&shared);
                     if !st.clients.contains_key(&cid) {
                         break;
                     }
                     st.handle_event(&shared, cid, ev);
                 }
             }
-            shared.lock().unwrap().clients.remove(&cid);
+            crate::api::lock(&shared).clients.remove(&cid);
         }
     }
 }
@@ -1574,12 +1610,12 @@ pub fn run() -> Result<()> {
         notify: tx,
     }));
     {
-        let mut st = shared.lock().unwrap();
+        let mut st = crate::api::lock(&shared);
         for c in st.cfg.commands.clone() {
             let _ = commands::parse(&c).and_then(|cmd| st.exec_global(cmd));
         }
     }
-    if shared.lock().unwrap().cfg.persist {
+    if crate::api::lock(&shared).cfg.persist {
         match crate::persist::restore_on_start(&shared) {
             Ok(n) => crate::log!("restored {n} sessions"),
             Err(e) => crate::log!("restore failed: {e}"),
@@ -1596,7 +1632,7 @@ pub fn run() -> Result<()> {
             let _ = rx.recv_timeout(Duration::from_millis(500));
             std::thread::sleep(Duration::from_millis(8));
             while rx.try_recv().is_ok() {}
-            let mut st = sh.lock().unwrap();
+            let mut st = crate::api::lock(&sh);
             let tick = last_tick.elapsed() > Duration::from_millis(500);
             if tick {
                 last_tick = Instant::now();
@@ -1696,4 +1732,25 @@ pub fn run() -> Result<()> {
         std::thread::spawn(move || handle_conn(sh, id, conn));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contain_vt;
+
+    #[test]
+    fn vt100_wide_char_resize_panic_is_contained() {
+        let mut p = vt100::Parser::new(5, 4, 0);
+        p.process("中中中中".as_bytes());
+        p.screen_mut().set_size(5, 3);
+        let r = contain_vt(&mut p, 5, 3, 0, |vt| vt.process("x中y".as_bytes()));
+        assert!(
+            r.is_none(),
+            "vt100 no longer panics here; the guard can be revisited"
+        );
+        assert_eq!(p.screen().size(), (5, 3));
+        p.process(b"ok");
+        assert!(p.screen().contents().contains("ok"));
+        assert_eq!(contain_vt(&mut p, 5, 3, 0, |_| 7), Some(7));
+    }
 }

@@ -5,8 +5,8 @@
 //! check. Waits poll every [`POLL_INTERVAL`] and never sleep while holding the lock.
 use super::pane as pane_api;
 use super::{
-    AgentInfo, ApiError, ApiResult, ReadSource, Reply, Request, Status, Target, WaitSpec,
-    pane_id_str, pane_json,
+    AgentInfo, ApiError, ApiResult, LABEL_MAX, POLL_INTERVAL, RESTORE_SOURCE, ReadSource, Reply,
+    Request, Status, Target, WaitSpec, clean_text, is_agent_name, lock, pane_id_str, pane_json,
 };
 use crate::config::Config;
 use crate::server::{Pane, Shared, State};
@@ -17,12 +17,9 @@ use std::time::{Duration, Instant};
 const SUBMIT_ENTER_DELAY_MS: u64 = 150;
 /// A waited prompt must start the agent (Working or Blocked) within this window.
 const PROMPT_START_LIMIT: Duration = Duration::from_millis(5000);
-/// Interval between status checks while waiting.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Longest kept report message, in characters.
-const MESSAGE_MAX_CHARS: usize = 80;
 /// Default wait set when a request names no statuses.
 const DEFAULT_UNTIL: [Status; 3] = [Status::Idle, Status::Done, Status::Blocked];
+/// Source tag that `persist` gives agents restored after a server restart.
 
 /// Effective status of a pane.
 pub fn status(p: &Pane, cfg: &Config) -> Status {
@@ -80,11 +77,12 @@ pub fn handle(shared: &Shared, req: Request) -> ApiResult {
             agent,
             seq,
         } => release_agent(shared, pane, &source, &agent, seq),
-        Request::AgentList => locked(shared, |st| Ok(agent_list(st))),
-        Request::AgentGet { target } => locked(shared, |st| {
-            let pid = resolve_target(st, &target)?;
-            Ok(json!({"agent": pane_obj(st, pid)?}))
-        }),
+        Request::AgentList => Ok(agent_list(&lock(shared))),
+        Request::AgentGet { target } => {
+            let st = lock(shared);
+            let pid = resolve_target(&st, &target)?;
+            Ok(json!({"agent": pane_obj(&st, pid)?}))
+        }
         Request::AgentRead {
             target,
             source,
@@ -105,17 +103,6 @@ pub fn handle(shared: &Shared, req: Request) -> ApiResult {
         }
     };
     value.map(Reply::Json)
-}
-
-/// Run `f` under the state lock. A poisoned lock becomes an `internal` error.
-fn locked<T>(
-    shared: &Shared,
-    f: impl FnOnce(&mut State) -> Result<T, ApiError>,
-) -> Result<T, ApiError> {
-    let mut st = shared
-        .lock()
-        .map_err(|_| ApiError::new("internal", "state lock poisoned"))?;
-    f(&mut st)
 }
 
 fn pane_obj(st: &State, pid: usize) -> Result<Value, ApiError> {
@@ -162,27 +149,27 @@ pub fn resolve_target(st: &State, t: &Target) -> Result<usize, ApiError> {
     }
 }
 
-/// Trim, drop control characters, cap the length. Empty text becomes `None`.
+/// Trim, drop control characters, cap at [`LABEL_MAX`]. Empty text becomes `None`.
 pub fn normalize_message(raw: Option<&str>) -> Option<String> {
-    let kept: String = raw?
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MESSAGE_MAX_CHARS)
-        .collect();
-    let kept = kept.trim();
-    (!kept.is_empty()).then(|| kept.to_string())
+    clean_text(raw?, LABEL_MAX)
 }
 
-/// Trimmed, printable, non-empty name. `None` clears the name.
+/// Agent label as stored and compared: cleaned display text, never empty.
+fn normalize_label(raw: &str) -> Result<String, ApiError> {
+    clean_text(raw, LABEL_MAX).ok_or_else(|| ApiError::invalid("agent label must not be empty"))
+}
+
+/// Agent name for `agent rename`. `None` clears the name. Otherwise the name must pass
+/// [`is_agent_name`], which also rejects pane-id shaped names such as `p1`.
 fn normalize_name(raw: Option<String>) -> Result<Option<String>, ApiError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
     let name = raw.trim();
-    if name.is_empty() || name.chars().any(char::is_control) {
+    if !is_agent_name(name) {
         return Err(ApiError::invalid(
-            "agent name must be non-empty text without control characters",
+            "agent name must start with a letter, use only a-z 0-9 _ -, be at most 32 \
+             characters, and not look like a pane id",
         ));
     }
     Ok(Some(name.to_string()))
@@ -197,9 +184,19 @@ pub fn is_stale(existing: Option<&AgentInfo>, source: &str, seq: Option<u64>) ->
     }
 }
 
-/// True when the stored agent belongs to this reporter and agent label.
-fn is_owned_by(existing: Option<&AgentInfo>, source: &str, agent: &str) -> bool {
-    existing.is_some_and(|a| a.source == source && a.agent == agent)
+/// True when a release may act on the stored agent: the same reporter and label, or an agent
+/// restored after a server restart (source [`RESTORE_SOURCE`]) with the same label, so the
+/// hook that owns the agent can take it over.
+fn may_release(existing: Option<&AgentInfo>, source: &str, agent: &str) -> bool {
+    existing.is_some_and(|a| a.agent == agent && (a.source == source || a.source == RESTORE_SOURCE))
+}
+
+/// Seq to keep when a report omits `--seq`: the stored seq, but only while the same source
+/// owns the agent. Another source's numbering must not gate this reporter's reports.
+fn kept_seq(existing: Option<&AgentInfo>, source: &str) -> Option<u64> {
+    existing
+        .filter(|old| old.source == source)
+        .and_then(|old| old.seq)
 }
 
 /// Stored agent info for an accepted report. A report for the same agent label keeps the
@@ -215,12 +212,13 @@ fn merge_info(existing: Option<&AgentInfo>, r: Report) -> AgentInfo {
         Some(old) if same_label && r.resume.is_empty() => old.resume.clone(),
         _ => r.resume,
     };
+    let seq = r.seq.or_else(|| kept_seq(existing, &r.source));
     AgentInfo {
         source: r.source,
         agent: r.agent,
         state: r.state,
         message: normalize_message(r.message.as_deref()),
-        seq: r.seq,
+        seq,
         name,
         resume,
     }
@@ -236,26 +234,26 @@ fn validate_report(r: &Report) -> Result<(), ApiError> {
             r.state.as_str()
         )));
     }
-    if r.source.trim().is_empty() || r.agent.trim().is_empty() {
-        return Err(ApiError::invalid("source and agent must not be empty"));
+    if r.source.trim().is_empty() {
+        return Err(ApiError::invalid("source must not be empty"));
     }
     Ok(())
 }
 
-fn report_agent(shared: &Shared, pid: usize, r: Report) -> Result<Value, ApiError> {
+fn report_agent(shared: &Shared, pid: usize, mut r: Report) -> Result<Value, ApiError> {
     validate_report(&r)?;
-    locked(shared, |st| {
-        let p = st
-            .panes
-            .get_mut(&pid)
-            .ok_or_else(|| ApiError::pane_not_found(pid))?;
-        let applied = !is_stale(p.agent.as_ref(), &r.source, r.seq);
-        if applied {
-            p.agent = Some(merge_info(p.agent.as_ref(), r));
-            st.mark_dirty();
-        }
-        Ok(json!({"applied": applied, "pane": pane_obj(st, pid)?}))
-    })
+    r.agent = normalize_label(&r.agent)?;
+    let mut st = lock(shared);
+    let p = st
+        .panes
+        .get_mut(&pid)
+        .ok_or_else(|| ApiError::pane_not_found(pid))?;
+    let applied = !is_stale(p.agent.as_ref(), &r.source, r.seq);
+    if applied {
+        p.agent = Some(merge_info(p.agent.as_ref(), r));
+        st.mark_dirty();
+    }
+    Ok(json!({"applied": applied, "pane": pane_obj(&st, pid)?}))
 }
 
 fn release_agent(
@@ -265,24 +263,24 @@ fn release_agent(
     agent: &str,
     seq: Option<u64>,
 ) -> Result<Value, ApiError> {
-    locked(shared, |st| {
-        let p = st
-            .panes
-            .get_mut(&pid)
-            .ok_or_else(|| ApiError::pane_not_found(pid))?;
-        if !is_owned_by(p.agent.as_ref(), source, agent) {
-            return Err(ApiError::new(
-                "agent_not_found",
-                format!("no agent {agent:?} from {source:?} on {}", pane_id_str(pid)),
-            ));
-        }
-        if is_stale(p.agent.as_ref(), source, seq) {
-            return Ok(json!({"released": false}));
-        }
-        p.agent = None;
-        st.mark_dirty();
-        Ok(json!({"released": true}))
-    })
+    let agent = normalize_label(agent)?;
+    let mut st = lock(shared);
+    let p = st
+        .panes
+        .get_mut(&pid)
+        .ok_or_else(|| ApiError::pane_not_found(pid))?;
+    if !may_release(p.agent.as_ref(), source, &agent) {
+        return Err(ApiError::new(
+            "agent_not_found",
+            format!("no agent {agent:?} from {source:?} on {}", pane_id_str(pid)),
+        ));
+    }
+    if is_stale(p.agent.as_ref(), source, seq) {
+        return Ok(json!({"released": false}));
+    }
+    p.agent = None;
+    st.mark_dirty();
+    Ok(json!({"released": true}))
 }
 
 fn agent_list(st: &State) -> Value {
@@ -306,58 +304,54 @@ fn read_agent(
     source: ReadSource,
     lines: Option<usize>,
 ) -> ApiResult {
-    let text = locked(shared, |st| {
-        let pid = resolve_target(st, target)?;
-        pane_api::read_text(st, pid, source, lines)
-    })?;
+    let mut st = lock(shared);
+    let pid = resolve_target(&st, target)?;
+    let text = pane_api::read_text(&mut st, pid, source, lines)?;
     Ok(Reply::Text(text))
 }
 
 fn send_keys_to(shared: &Shared, target: &Target, keys: &[String]) -> Result<Value, ApiError> {
-    locked(shared, |st| {
-        let pid = resolve_target(st, target)?;
-        pane_api::send_keys(st, pid, keys)?;
-        Ok(json!({"sent": true}))
-    })
+    let mut st = lock(shared);
+    let pid = resolve_target(&st, target)?;
+    pane_api::send_keys(&mut st, pid, keys)?;
+    Ok(json!({"sent": true}))
 }
 
 fn focus_agent(shared: &Shared, target: &Target) -> Result<Value, ApiError> {
-    locked(shared, |st| {
-        let pid = resolve_target(st, target)?;
-        if !st.focus_pane(pid) {
-            return Err(ApiError::pane_not_found(pid));
-        }
-        st.mark_dirty();
-        Ok(json!({"agent": pane_obj(st, pid)?}))
-    })
+    let mut st = lock(shared);
+    let pid = resolve_target(&st, target)?;
+    if !st.focus_pane(pid) {
+        return Err(ApiError::pane_not_found(pid));
+    }
+    st.mark_dirty();
+    Ok(json!({"agent": pane_obj(&st, pid)?}))
 }
 
 fn rename_agent(shared: &Shared, target: &Target, name: Option<String>) -> Result<Value, ApiError> {
     let name = normalize_name(name)?;
-    locked(shared, |st| {
-        let pid = resolve_target(st, target)?;
-        if st.panes.get(&pid).is_none_or(|p| p.agent.is_none()) {
-            return Err(ApiError::new(
-                "agent_not_found",
-                format!("{} has no reported agent", pane_id_str(pid)),
-            ));
-        }
-        let taken = name
-            .as_deref()
-            .is_some_and(|n| name_conflict(&owners_of(st, n), pid));
-        if taken {
-            let n = name.as_deref().unwrap_or_default();
-            return Err(ApiError::new(
-                "name_taken",
-                format!("agent name {n:?} is in use"),
-            ));
-        }
-        if let Some(a) = st.panes.get_mut(&pid).and_then(|p| p.agent.as_mut()) {
-            a.name = name;
-        }
-        st.mark_dirty();
-        Ok(json!({"agent": pane_obj(st, pid)?}))
-    })
+    let mut st = lock(shared);
+    let pid = resolve_target(&st, target)?;
+    if st.panes.get(&pid).is_none_or(|p| p.agent.is_none()) {
+        return Err(ApiError::new(
+            "agent_not_found",
+            format!("{} has no reported agent", pane_id_str(pid)),
+        ));
+    }
+    let taken = name
+        .as_deref()
+        .is_some_and(|n| name_conflict(&owners_of(&st, n), pid));
+    if taken {
+        let n = name.as_deref().unwrap_or_default();
+        return Err(ApiError::new(
+            "name_taken",
+            format!("agent name {n:?} is in use"),
+        ));
+    }
+    if let Some(a) = st.panes.get_mut(&pid).and_then(|p| p.agent.as_mut()) {
+        a.name = name;
+    }
+    st.mark_dirty();
+    Ok(json!({"agent": pane_obj(&st, pid)?}))
 }
 
 /// Statuses that end a wait. An empty request means the default set.
@@ -392,7 +386,7 @@ enum Outcome {
 }
 
 /// Poll `pid` until `hit` accepts its status or `deadline` passes. The lock is taken only for
-/// each check. A pane that disappears is `pane_not_found`.
+/// each check, and never across the sleep. A pane that disappears is `pane_not_found`.
 fn poll_until(
     shared: &Shared,
     pid: usize,
@@ -400,7 +394,7 @@ fn poll_until(
     hit: impl Fn(Status) -> bool,
 ) -> Result<Outcome, ApiError> {
     loop {
-        let status = locked(shared, |st| status_of(st, pid))?;
+        let status = status_of(&lock(shared), pid)?;
         if hit(status) {
             return Ok(Outcome::Matched(status));
         }
@@ -435,10 +429,10 @@ fn agent_wait(
     wait: &WaitSpec,
     start: Instant,
 ) -> Result<Value, ApiError> {
-    let pid = locked(shared, |st| resolve_target(st, target))?;
+    let pid = resolve_target(&lock(shared), target)?;
     let until = until_set(&wait.until);
     let status = wait_for(shared, pid, deadline(start, wait.timeout_ms), &until)?;
-    let agent = locked(shared, |st| pane_obj(st, pid))?;
+    let agent = pane_obj(&lock(shared), pid)?;
     Ok(json!({"agent": agent, "status": status.as_str()}))
 }
 
@@ -466,10 +460,12 @@ fn agent_prompt(
     wait: Option<&WaitSpec>,
     start: Instant,
 ) -> Result<Value, ApiError> {
-    let (pid, before) = locked(shared, |st| {
-        let pid = resolve_target(st, target)?;
-        Ok((pid, status_of(st, pid)?))
-    })?;
+    let (pid, before) = {
+        let st = lock(shared);
+        let pid = resolve_target(&st, target)?;
+        let before = status_of(&st, pid)?;
+        (pid, before)
+    };
     if before == Status::Blocked {
         return Err(ApiError::new(
             "agent_blocked",
@@ -478,7 +474,7 @@ fn agent_prompt(
     }
     pane_api::submit(shared, pid, text, SUBMIT_ENTER_DELAY_MS)?;
     let Some(wait) = wait else {
-        let agent = locked(shared, |st| pane_obj(st, pid))?;
+        let agent = pane_obj(&lock(shared), pid)?;
         return Ok(json!({"sent": true, "agent": agent}));
     };
     let caller = deadline(start, wait.timeout_ms);
@@ -487,7 +483,7 @@ fn agent_prompt(
     }
     let until = until_set(&wait.until);
     let status = wait_for(shared, pid, caller, &until)?;
-    let agent = locked(shared, |st| pane_obj(st, pid))?;
+    let agent = pane_obj(&lock(shared), pid)?;
     Ok(json!({"sent": true, "agent": agent, "status": status.as_str()}))
 }
 
@@ -559,10 +555,13 @@ mod tests {
         let long = "字".repeat(200);
         assert_eq!(
             normalize_message(Some(&long)).map(|m| m.chars().count()),
-            Some(80)
+            Some(LABEL_MAX)
         );
         let ascii = "a".repeat(120);
-        assert_eq!(normalize_message(Some(&ascii)).map(|m| m.len()), Some(80));
+        assert_eq!(
+            normalize_message(Some(&ascii)).map(|m| m.len()),
+            Some(LABEL_MAX)
+        );
     }
 
     #[test]
@@ -579,6 +578,41 @@ mod tests {
             "hook",
             Some(1)
         ));
+    }
+
+    #[test]
+    fn report_without_seq_keeps_stored_seq_from_same_source() {
+        let old = info("hook", "claude", Some(5));
+        let quiet = Report {
+            seq: None,
+            ..report("claude", vec![])
+        };
+        let merged = merge_info(Some(&old), quiet);
+        assert_eq!(merged.seq, Some(5));
+        assert!(is_stale(Some(&merged), "hook", Some(4)));
+        assert!(!is_stale(Some(&merged), "hook", Some(6)));
+    }
+
+    #[test]
+    fn report_without_seq_drops_seq_of_another_source() {
+        let old = info("other", "claude", Some(9));
+        let quiet = Report {
+            seq: None,
+            ..report("claude", vec![])
+        };
+        assert_eq!(merge_info(Some(&old), quiet).seq, None);
+        assert_eq!(kept_seq(Some(&old), "hook"), None);
+        assert_eq!(kept_seq(Some(&old), "other"), Some(9));
+        assert_eq!(kept_seq(None, "hook"), None);
+    }
+
+    #[test]
+    fn report_with_seq_replaces_stored_seq() {
+        let old = info("hook", "claude", Some(5));
+        assert_eq!(
+            merge_info(Some(&old), report("claude", vec![])).seq,
+            Some(2)
+        );
     }
 
     #[test]
@@ -607,12 +641,30 @@ mod tests {
     }
 
     #[test]
+    fn report_takes_over_restored_agent_with_same_label() {
+        let mut restored = info(RESTORE_SOURCE, "claude", None);
+        restored.name = Some("reviewer".into());
+        assert!(!is_stale(Some(&restored), "hook", Some(1)));
+        let merged = merge_info(Some(&restored), report("claude", vec![]));
+        assert_eq!(merged.source, "hook");
+        assert_eq!(merged.name.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
     fn release_matches_source_and_label_only() {
         let old = info("hook", "claude", None);
-        assert!(is_owned_by(Some(&old), "hook", "claude"));
-        assert!(!is_owned_by(Some(&old), "hook", "codex"));
-        assert!(!is_owned_by(Some(&old), "other", "claude"));
-        assert!(!is_owned_by(None, "hook", "claude"));
+        assert!(may_release(Some(&old), "hook", "claude"));
+        assert!(!may_release(Some(&old), "hook", "codex"));
+        assert!(!may_release(Some(&old), "other", "claude"));
+        assert!(!may_release(None, "hook", "claude"));
+    }
+
+    #[test]
+    fn release_takes_over_restored_agent_with_same_label_only() {
+        let restored = info(RESTORE_SOURCE, "claude", None);
+        assert!(may_release(Some(&restored), "hook", "claude"));
+        assert!(!may_release(Some(&restored), "hook", "codex"));
+        assert!(may_release(Some(&restored), RESTORE_SOURCE, "claude"));
     }
 
     #[test]
@@ -632,6 +684,20 @@ mod tests {
             validate_report(&empty).unwrap_err().code,
             "invalid_argument"
         );
+    }
+
+    #[test]
+    fn agent_label_is_cleaned_and_never_empty() {
+        assert_eq!(
+            normalize_label("  claude\u{1b}\n"),
+            Ok("claude".to_string())
+        );
+        assert_eq!(
+            normalize_label(" \t ").unwrap_err().code,
+            "invalid_argument"
+        );
+        let long = "x".repeat(200);
+        assert_eq!(normalize_label(&long).map(|s| s.len()), Ok(LABEL_MAX));
     }
 
     #[test]
@@ -659,14 +725,20 @@ mod tests {
     }
 
     #[test]
-    fn name_normalization() {
+    fn name_normalization_accepts_names_and_rejects_pane_ids() {
         assert_eq!(normalize_name(None), Ok(None));
         assert_eq!(
             normalize_name(Some("  bob ".into())),
             Ok(Some("bob".into()))
         );
-        assert!(normalize_name(Some("  ".into())).is_err());
-        assert!(normalize_name(Some("a\nb".into())).is_err());
+        assert_eq!(
+            normalize_name(Some("reviewer-2".into())),
+            Ok(Some("reviewer-2".into()))
+        );
+        for bad in ["  ", "a\nb", "p1", " p42 ", "Bob", "1a"] {
+            let err = normalize_name(Some(bad.into())).unwrap_err();
+            assert_eq!(err.code, "invalid_argument", "{bad:?}");
+        }
     }
 
     #[test]
