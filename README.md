@@ -12,14 +12,26 @@ A cross-platform terminal multiplexer written in Rust, inspired by tmux and herd
 - 水平／垂直分割窗格、切換焦點、調整大小、縮放、關閉 · Horizontal/vertical splits, focus movement, resize, zoom, close
 - tmux 風格前綴鍵（預設 `Ctrl-b`）· tmux-style prefix key (default `Ctrl-b`)
 - 捲動回溯（scrollback）與捲動模式 · Scrollback with scroll mode
-- 滑鼠：點選聚焦窗格、點狀態列切換視窗、滾輪捲動 · Mouse: click to focus, click status bar to switch windows, wheel to scroll
-- herdr 風格側邊欄：顯示所有 session / pane 的狀態（● 執行中 working、◆ 完成待查看 done、○ 閒置 idle），適合同時監看多個 AI agent
-  herdr-like sidebar showing every pane's status (● working, ◆ done/needs attention, ○ idle) — handy for watching several AI coding agents
+- 滑鼠：點選聚焦窗格（含側邊欄列與窗格標題列）、點狀態列切換視窗、點 session 名稱開啟選單、點計數跳到需要處理的窗格、滾輪捲動；點擊會取消等待中的前綴鍵 · Mouse: click to focus panes (including sidebar rows and pane title rows), click a window label to switch windows, click the session name to open the chooser, click the counters to jump to the next pane needing attention, wheel to scroll; any click cancels a pending prefix
+- Agent 狀態處處可見：▲ 等待你（blocked）、◆ 完成未查看（done）、● 執行中（working）、○ 閒置（idle）；顯示於狀態列計數、視窗標籤、窗格標題列、側邊欄與選單，每種狀態都有符號與文字，不只靠顏色（見下方「狀態符號」）
+  Agent status everywhere: ▲ blocked, ◆ done, ● working, ○ idle — in the status-bar counts, window labels, pane title rows, the sidebar and the chooser; every state has a glyph and a word, not just a color (see Status glyphs below)
+- 側邊欄（`prefix a`）：依 session 分組列出每個窗格的狀態與 blocked 訊息，適合同時監看多個 AI agent；終端機太窄時自動隱藏
+  Sidebar (`prefix a`): panes grouped by session with their state and blocked message, handy for watching several AI agents; hidden automatically when the terminal is too narrow
+- 需要處理的窗格：`prefix Tab` / `prefix BTab` 跳到下一個／上一個等待你或完成未查看的窗格（blocked 優先，跨 session）；背景窗格變為 blocked 時顯示提示
+  Next attention: `prefix Tab` / `prefix BTab` jump to the next / previous pane that needs you (blocked first, then done, across sessions); a background pane turning blocked shows a toast
+- 窗格標題列：分割視窗中，有 agent 回報或標籤的窗格顯示狀態與窗格 ID，例如 `▲ claude · blocked`（`pane-titles`）
+  Pane title rows: in split windows, panes with an agent report or label show their state and pane ID, e.g. `▲ claude · blocked` (`pane-titles`)
+- 按鍵提示列（which-key）：按下前綴鍵後，狀態列列出常用按鍵，內容取自目前的按鍵設定
+  Which-key bar: after the prefix, the status bar lists the common keys, taken from your current bindings
+- 確認提示：互動式 `x`、`&` 與選單中 session／視窗列的 `x` 會先以 y/n 確認（`confirm-close`）；指令列、CLI 與 API 仍立即執行
+  Confirmations: interactive `x`, `&` and the chooser's `x` on session and window rows ask y/n first (`confirm-close`); typed commands, the CLI and the API still run at once
+- 主題與無色模式：`[theme]` 提供 terminal / dark / light / mono 預設並可逐項覆寫顏色；支援 `NO_COLOR`、`TERM=dumb` 與 `TMUXLIKE_ASCII=1`（改用 ASCII 字元）
+  Themes: `[theme]` presets terminal / dark / light / mono with per-token color overrides; honors `NO_COLOR`, `TERM=dumb` and `TMUXLIKE_ASCII=1` (ASCII glyphs)
 - 複製模式：vi 風格游標移動與選取（`v` 字元 / `V` 整行），`y` 複製；滑鼠拖曳選取自動複製；`prefix ]` 貼上；同時透過 OSC 52 寫入系統剪貼簿
   Copy mode with vi-style movement and selection (`v` / `V`, `y` to yank), mouse-drag selection, `prefix ]` to paste, system clipboard via OSC 52
 - `:` 指令列，支援 tmux 風格指令 · `:` command prompt with tmux-style commands
 - 自訂按鍵（config.toml 的 `[bind]` / `unbind`，或執行期 `bind-key` / `unbind-key`）· Custom key bindings
-- Session／視窗選單（`prefix s`）· Interactive session/window tree chooser
+- Session／視窗／窗格選單（`prefix s` / `w` / `g`），可依狀態篩選 · Interactive session/window/pane tree chooser (`prefix s` / `w` / `g`), filterable by state
 - 重新命名視窗（`prefix ,`）與 session（`prefix $`）；視窗名稱自動依前景程式命名（手動命名後停止）
   Rename window / session; windows auto-named after the foreground process (Linux/macOS) until renamed manually
 - 不需重啟即可重新載入設定（`prefix r` 或 `source-file`）· Reload config without restarting (`prefix r` / `source-file`)
@@ -30,6 +42,21 @@ A cross-platform terminal multiplexer written in Rust, inspired by tmux and herd
   JSON automation API: `tmuxlike pane|agent|session|api ...` lists, splits, types into and reads panes, and reports and waits on agent state (see below)
 - 版面保存：伺服器重啟後還原 session、視窗、分割與窗格目錄（Linux 為即時目錄，其他平台為啟動目錄）（`persist`）
   Layout persistence: sessions, windows, splits and pane directories are restored after a server restart (live directories on Linux, start directories elsewhere) (`persist`)
+
+## 狀態符號 Status glyphs
+
+| 狀態 State | 符號 Glyph | ASCII | 意義 Meaning | 預設顏色 Default color |
+|---|---|---|---|---|
+| working | `●` | `@` | 執行中 Busy | 黃 yellow |
+| blocked | `▲` | `!` | 等待核准或提問 Waiting for approval or a question | 紅 red |
+| done | `◆` | `+` | 閒置，且有尚未查看的輸出 Idle, output not yet viewed | 綠 green |
+| idle | `○` | `-` | 閒置 Idle | 灰 gray |
+| unknown | `?` | `?` | 無法判斷，不代表已完成 Cannot classify; does not mean finished | 灰 gray |
+
+- 符號形狀各不相同，不靠顏色區分；側邊欄與窗格標題列另附狀態文字。顏色為 ANSI 色，跟隨終端機配色，可用 `[theme]` 覆寫。
+  The shapes differ, so color is not needed to tell them apart; the sidebar and pane titles also print the word. Colors are ANSI and follow your terminal theme; override them with `[theme]`.
+- 視窗標籤顯示其窗格中最需要注意的狀態（▲ > ◆ > ● > ?；全部閒置時不顯示）；狀態列計數只列 ▲ ◆ ●，零不顯示。標籤旗標：`*` 目前視窗、`Z` 已縮放、`!` 有尚未查看的輸出。
+  A window label shows its most urgent pane state (▲ > ◆ > ● > ?; hidden when all panes are idle). The status-bar counts list ▲ ◆ ● only; zeros are hidden. Label flags: `*` current window, `Z` zoomed, `!` output not yet viewed.
 
 ## 安裝 Install
 
@@ -72,21 +99,25 @@ tmuxlike set mouse off          # 任何伺服器指令皆可從命令列執行 
 | 方向鍵 Arrows / `h j k l` | 移動焦點 Move focus |
 | `Ctrl`/`Alt`+方向鍵, `H J K L` | 調整窗格大小 Resize pane |
 | `o` | 下一個窗格 Next pane |
+| `Tab` / `BTab` | 下一個／上一個需要處理的窗格（blocked 優先，再 done，跨 session）Next / previous pane needing you (blocked first, then done; across sessions) |
 | `z` | 縮放（最大化）窗格 Zoom pane |
-| `x` | 關閉窗格 Kill pane |
-| `&` | 關閉視窗 Kill window |
+| `x` | 關閉窗格（y/n 確認）Kill pane (asks y/n) |
+| `&` | 關閉視窗（y/n 確認）Kill window (asks y/n) |
 | `[` / `PgUp` | 複製模式 Copy mode（見下 see below）|
 | `]` | 貼上緩衝區 Paste buffer |
 | `:` | 指令列 Command prompt |
 | `,` | 重新命名視窗 Rename window |
 | `$` | 重新命名 session Rename session |
-| `s` / `w` | Session／視窗選單 Session/window chooser (`↑↓` `Enter`, `x` 刪除 kill, `Esc`) |
+| `s` / `w` / `g` | Session／視窗／窗格選單（見下節）Session/window/pane chooser (see below); `g` is an alias |
 | `(` `)` | 上一個／下一個 session Previous / next session |
 | `a` or `b` | 切換側邊欄 Toggle status sidebar |
 | `r` | 重新載入設定 Reload config |
 | `?` | 列出按鍵 List key bindings (`j/k/Space` 捲動 scroll) |
 | `d` | 離開（detach）Detach |
 | `Ctrl-b` | 傳送前綴鍵給程式 Send prefix to the program |
+
+按下前綴鍵後，狀態列改為「按鍵提示列」（which-key bar），列出常用按鍵與用途，內容取自目前的按鍵設定，改綁後會跟著變。沒有逾時：下一個按鍵、`Esc` 或點擊會結束它。未綁定的按鍵會顯示 `C-b X is not bound (C-b ? lists keys)`。`confirm-close` 開啟時，`x` 與 `&` 會詢問 `kill pane p2 (…)? (y/n)`，按 `y` 執行，其他鍵取消。
+After the prefix, the status bar becomes a which-key bar listing the common keys and their uses, taken from your current bindings, so rebinding is reflected. It does not time out: the next key, `Esc` or a click ends it. An unbound key shows `C-b X is not bound (C-b ? lists keys)`. With `confirm-close` on, `x` and `&` ask `kill pane p2 (…)? (y/n)`: `y` runs it, any other key cancels.
 
 ### 複製模式 Copy mode
 
@@ -107,6 +138,32 @@ tmuxlike set mouse off          # 任何伺服器指令皆可從命令列執行 
 滑鼠：在窗格內拖曳即選取，放開時自動複製（含 OSC 52 系統剪貼簿）。
 Mouse: drag inside a pane to select; releasing copies (also to the system clipboard via OSC 52).
 
+### 選單 Chooser（`prefix s` / `w` / `g`）
+
+| 按鍵 Key | 動作 Action |
+|---|---|
+| `j` `k` / `↑` `↓` | 移動選取 Move selection |
+| `Enter` | 跳到該列：session、視窗或窗格（窗格列會聚焦該窗格）Jump to the row (a pane row focuses that pane) |
+| `b` `w` `d` `i` | 只顯示 blocked／working／done／idle 的窗格（連同上層列）Show only panes in that state, with their parent rows |
+| `a` | 取消篩選 Show all |
+| `x` | 關閉選取的 session 或視窗（y/n 確認）Kill the selected session or window (asks y/n); on a pane row use `C-b x` |
+| `Esc` / `q` | 關閉 Close |
+
+其他按鍵會被忽略，選單保持開啟。滑鼠點擊會關閉選單，滾輪移動選取。
+Other keys are ignored and the chooser stays open. A mouse click closes it; the wheel moves the selection.
+
+### 指令列與改名輸入 Prompt editing（`:` `,` `$`）
+
+| 按鍵 Key | 動作 Action |
+|---|---|
+| `←` `→` / `Ctrl-b` `Ctrl-f` | 移動游標 Move cursor |
+| `Home` / `Ctrl-a`，`End` / `Ctrl-e` | 行首／行尾 Start / end of line |
+| `Backspace` / `Ctrl-h`，`Delete` | 刪除游標前／後的字元 Delete before / after the cursor |
+| `Ctrl-w` | 刪除前一個詞 Delete the previous word |
+| `Ctrl-k` / `Ctrl-u` | 刪到行尾／行首 Delete to end / start of line |
+| `↑` `↓` | `:` 指令歷史（最近 50 筆）Command history, last 50 (`:` prompt only) |
+| `Enter` / `Esc` | 執行／取消 Run / cancel |
+
 ## 指令 Commands
 
 可在 `prefix :`、`bind`、`commands = [...]`、文字設定檔或命令列（`tmuxlike <command>`）使用。
@@ -120,9 +177,34 @@ next-window  previous-window  select-window -t N          copy-mode [-u]   paste
 choose-tree  switch-client -n|-p  detach-client           toggle-sidebar   command-prompt
 source-file [PATH]            set OPTION VALUE            display-message TEXT   list-keys
 bind-key KEY COMMAND...       unbind-key KEY | -a         send-prefix
+next-attention [-p]           confirm-before [-p TEXT] CMD
+kill-session -t NAME          kill-window -t SESSION:IDX
 ```
 
+- `next-attention [-p]`：跳到下一個（`-p`：上一個）需要處理的窗格。從 CLI 執行時印出如 `p2 blocked` 並聚焦該窗格；沒有時 exit 1。Jump to the next (`-p`: previous) pane needing attention. From the CLI it prints e.g. `p2 blocked` and focuses the pane; with none it exits 1.
+- `confirm-before [-p TEXT] CMD`：先以 y/n 詢問，再執行 CMD；`-p` 指定提問文字，省略時說明目標與其狀態。`confirm-close off`，或沒有連線的客戶端時，直接執行。Ask y/n, then run CMD; `-p` sets the question (otherwise it names the target and its state). It runs at once when `confirm-close` is off or no client is attached.
+- `kill-session -t NAME`；`kill-window -t SESSION:IDX`（只給 `SESSION` 時為其目前視窗）。`kill-session -t NAME`; `kill-window -t SESSION:IDX` (with only `SESSION`, its current window).
+
 按鍵名稱 Key names: `c`, `%`, `C-a`, `M-x`, `C-M-Left`, `Up`, `PageUp`, `F5`, `Space`, `Enter`, `Escape`, `BSpace`, `^A`…
+
+### 測試用 debug-frame Test hook: debug-frame
+
+`debug-frame -t S` 以不連線的假客戶端渲染 session S 的畫面，供測試與畫面比對使用，不是日常指令。`--text` 印出純文字列（無跳脫碼）。
+`debug-frame -t S` renders session S with a throwaway client, for tests and frame comparisons; it is not a day-to-day command. `--text` prints plain text rows with no escape codes.
+
+| 旗標 Flag | 效果 Effect |
+|---|---|
+| `--text` | 純文字列 Plain text rows |
+| `--prefix` | 顯示按鍵提示列 Show the which-key bar |
+| `--prompt KIND:TEXT` | 開啟提示，KIND 為 `command`、`rename-window`、`rename-session` 或 `confirm` Open a prompt |
+| `--chooser[=N]` | 開啟選單，N 為選取列 Open the chooser with row N selected |
+| `--popup` | 開啟按鍵列表 Open the key list |
+| `--message TEXT` / `--error` | 狀態列訊息（`--error` 為錯誤樣式）Status-bar message (error style) |
+| `--copy` | 以複製模式渲染 Render in copy mode |
+
+```sh
+tmuxlike debug-frame -t demo --prefix --text   # 按下前綴鍵後的狀態列 / bar after the prefix
+```
 
 ## 自動化 API Automation API (herdr-style)
 
@@ -259,6 +341,9 @@ busy_secs = 1.5         # 最後輸出後幾秒內視為 working / seconds after
 automatic_rename = true # 依前景程式自動命名視窗 / auto-name windows
 osc52 = true            # 複製時寫入系統剪貼簿 / copy to system clipboard via OSC 52
 persist = true          # 保存並還原版面 / save and restore the layout across server restarts
+hints = true            # 狀態列的 "? help"、側邊欄提示與首次連線提示（which-key 不受影響）/ status-bar help, sidebar hint and first-attach tip (not the which-key bar)
+confirm_close = true    # x 與 & 先以 y/n 確認 / ask y/n before x and &
+pane_titles = "auto"    # 窗格標題列：off | auto | always / pane title rows
 
 unbind = ["x"]          # 移除預設按鍵；"all" 移除全部 / remove defaults ("all" = every default)
 commands = ["set busy-secs 2"]   # 載入後執行的指令 / commands run after loading
@@ -267,15 +352,59 @@ commands = ["set busy-secs 2"]   # 載入後執行的指令 / commands run after
 "C-k" = "kill-pane"
 v = "split-window -h"
 "M-1" = "select-window -t 1"
+
+[theme]                 # 顏色與字元 / colors and glyphs
+preset = "terminal"     # terminal（預設）| dark | light | mono
+ascii_glyphs = "auto"   # auto | "true" | "false"
+[theme.colors]          # 逐項覆寫 token / per-token overrides
+accent = "74"
+border_active = "#e5c07b"
 ```
 
-`set` 可用選項 options: `prefix`, `shell`, `mouse`, `sidebar`, `sidebar-width`, `scrollback`/`history-limit`（僅影響新窗格 new panes only）, `busy-secs`, `automatic-rename`, `osc52`/`set-clipboard`, `persist`.
+設定值一律為字串，數字與顏色要加引號（例如 `accent = "74"`）。設定檔無法解析時（例如 `accent = 74` 忘了引號），啟動時會印出 `config error` 並改用全部預設值；執行中的 `source-file` 則回報錯誤並保留原設定。
+Values are strings, so quote numbers and colors (for example `accent = "74"`). If the file cannot be parsed (for example `accent = 74` without quotes), startup prints `config error` and uses all defaults; a running `source-file` reports the error and keeps the current settings.
+
+`set` 可用選項 options: `prefix`, `shell`, `mouse`, `sidebar`, `sidebar-width`, `scrollback`/`history-limit`（僅影響新窗格 new panes only）, `busy-secs`, `automatic-rename`, `osc52`/`set-clipboard`, `persist`, `hints on|off`, `confirm-close on|off`, `pane-titles off|auto|always`, `theme terminal|dark|light|mono`, `ascii-glyphs auto|on|off`.
 
 重新載入 Reload: `prefix r`、`:source-file [PATH]` 或 `tmuxlike source-file`。`.toml` 檔會整個取代設定；其他副檔名視為每行一條指令（類似 `.tmux.conf`）。
 A `.toml` file replaces the whole config; any other file is run line by line as commands (like `.tmux.conf`).
 
 環境變數 Env: `TMUXLIKE_SOCKET` 可指定 socket 名稱以執行多個獨立伺服器 / set to run independent servers; `TMUXLIKE_STATE` 指定版面保存檔路徑 / path of the saved-layout file.
 
+### 窗格標題 Pane titles
+
+- `pane-titles`（預設 `auto`）：`auto` 只在分割視窗（≥ 2 個窗格）、未縮放、窗格高度 ≥ 6 列，且該窗格有 agent 回報或標籤時顯示；`always` 在分割且未縮放、高度 ≥ 2 列時一律顯示；`off` 關閉。
+  Default `auto`: shown only in split windows that are not zoomed, for panes at least 6 rows tall that have an agent report or a label. `always` shows them in every unzoomed split pane at least 2 rows tall. `off` hides them.
+- 標題佔用窗格的第一列：有標題的窗格，PTY 少 1 列，`pane list` 的 `rows` 也少 1。標題格式為 `符號 名稱 · 狀態`，窗格 ID 在右側；焦點窗格反白。點擊標題會聚焦該窗格。
+  A title takes the pane's first row, so a titled pane has 1 row less: its PTY is 1 row shorter and `pane list` reports `rows` 1 smaller. The title reads `glyph name · state`, with the pane ID on the right; the focused title is highlighted. Clicking a title focuses its pane.
+
+### 主題 Theme
+
+| preset | 說明 Description |
+|---|---|
+| `terminal`（預設 default） | ANSI 16 色，跟隨終端機配色 ANSI-16 colors that follow your terminal theme |
+| `dark` | 真彩色深色配色 Truecolor, for dark backgrounds |
+| `light` | 真彩色淺色配色 Truecolor, for light backgrounds |
+| `mono` | 不輸出彩色；焦點以反白或粗體、次要文字以淡色（DIM）表示 No colors: focus uses reverse video or bold, muted text uses DIM |
+
+`[theme.colors]` 可覆寫的 token（名稱與 `src/theme.rs` 相同）：`accent` `muted` `border` `border_active` `working` `blocked` `done` `idle` `unknown` `bar_bg` `bar_fg` `selection` `warn`。值為 `0-255`（256 色索引）、`"#rrggbb"` 或 `"reset"`；無法解析的值與未知的 token 會被忽略。
+Overridable tokens (names as in `src/theme.rs`): `accent` `muted` `border` `border_active` `working` `blocked` `done` `idle` `unknown` `bar_bg` `bar_fg` `selection` `warn`. Values are `0-255` (256-color index), `"#rrggbb"` or `"reset"`; unparsable values and unknown tokens are ignored.
+
+優先順序：明確指定的 `dark`、`light` 或 `mono` 優先於環境變數；`NO_COLOR` 與 `TERM=dumb` 只在 preset 為預設的 `terminal` 時使主題進入無色模式。
+Precedence: an explicit `dark`, `light` or `mono` wins over the environment; `NO_COLOR` and `TERM=dumb` switch the default `terminal` preset to no color, but do not affect `dark` or `light`.
+
+### 無色與 ASCII 字元 Color and ASCII glyphs
+
+| 環境變數 Variable | 效果 Effect |
+|---|---|
+| `NO_COLOR`（非空值 non-empty） | 預設 terminal 主題改為無色，保留 Unicode 符號與粗體、反白、淡色 No chrome colors; Unicode shapes and bold/reverse/DIM are kept |
+| `TERM=dumb` | 無色，並改用 ASCII 字元 No colors, and ASCII glyphs |
+| `TMUXLIKE_ASCII=1` | 改用 ASCII 字元：狀態 `@ ! + - ?`、框線 `\|` `-`、焦點框 `#` `=`；Linux／macOS 上非 UTF-8 的 locale 也會自動如此 ASCII glyphs; also automatic on a non-UTF-8 locale on Linux and macOS |
+
+- 環境變數由**連線的客戶端**讀取，因此每次連線可各自設定，例如 `NO_COLOR=1 tmuxlike attach -t work`。`NO_COLOR` 本身不會改用 ASCII 字元。
+  These variables are read by the attaching client, so set them per attach, e.g. `NO_COLOR=1 tmuxlike attach -t work`. `NO_COLOR` alone does not switch to ASCII glyphs.
+- `[theme] ascii_glyphs = "true"` 或 `"false"` 會覆寫環境變數；`"auto"`（預設）才依環境變數決定。
+  `ascii_glyphs = "true"` or `"false"` overrides the environment; `"auto"` (the default) follows it.
 ## 限制 Limitations
 
 - 視窗自動命名僅支援 Linux / macOS；Windows 使用 shell 名稱 / Automatic window naming works on Linux/macOS only; Windows uses the shell name
@@ -291,6 +420,11 @@ A `.toml` file replaces the whole config; any other file is run line by line as 
 - 尚未支援外掛 / No plugin system yet
 - 不會自動偵測 agent 種類，需由 agent 或 hook 呼叫 `pane report-agent` 回報；否則只有輸出活動推定 / No automatic agent detection: agents or hooks must call `pane report-agent`, otherwise only output-activity inference is available
 - 尚未支援 git worktree，以及 workspace／tab API（目前以 session／視窗對應）/ No git worktrees and no workspace/tab API yet (sessions and windows are used instead)
+- 選單不接受滑鼠選取列，任何點擊都會關閉它；請用鍵盤（`↑↓` `Enter`）/ The chooser does not take mouse selection: any click closes it; use the keys (`↑↓` `Enter`)
+- 終端機寬度不超過 `sidebar-width` + 20 欄（預設即 48 欄）時，側邊欄會直接隱藏，沒有提示 / When the terminal is not wider than `sidebar-width` + 20 columns (48 by default), the sidebar is hidden without a message
+- 前綴鍵等待沒有逾時設定 / The prefix key waits without a timeout (there is no prefix-timeout option yet)
+- 不明寬度（Ambiguous）字元：`● ▲ ◆ ○ │ ─ ▸ …` 在 CJK 寬字元的終端機（例如 CJK 代碼頁的 conhost）可能錯位；可設 `TMUXLIKE_ASCII=1` 或 `ascii_glyphs = "true"` 改用 ASCII 字元 / Ambiguous-width glyphs such as `● ▲ ◆ ○ │ ─ ▸ …` may misalign on CJK-wide terminals (for example a CJK-codepage conhost); use `TMUXLIKE_ASCII=1` or `ascii_glyphs = "true"` for ASCII glyphs
+- 螢幕閱讀器無法可靠朗讀 TUI（字元格重繪，順序不是閱讀順序）；請改用 `tmuxlike capture-pane -p`、`pane read` 或 `api snapshot` 取得純文字或 JSON / Screen readers cannot reliably follow a TUI (characters are repainted in a grid, not in reading order); use `capture-pane -p`, `pane read` or `api snapshot` for plain text or JSON
 
 ## 疑難排解 Troubleshooting
 

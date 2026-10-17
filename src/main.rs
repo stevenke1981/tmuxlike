@@ -69,8 +69,9 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
 Options (`set NAME VALUE` or config.toml):
   hints on|off            status-bar key hints and the first-attach tip (default on)
   confirm-close on|off    y/n before x and & (default on; off = kill at once)
-  pane-titles auto|on|off title row per pane (default auto)
-Mouse: click to focus pane / select window in status bar, wheel to scroll, drag to copy.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
+  pane-titles off|auto|always  title row per pane (auto: split window + agent/label)
+Mouse: click a pane or its title to focus, a window label to switch, the session chip for
+the chooser, the counters for the next alert, a sidebar row to jump; wheel scrolls; drag copies.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
 
 fn flag(args: &[String], f: &str) -> Option<String> {
     args.iter()
