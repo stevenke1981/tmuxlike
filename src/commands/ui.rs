@@ -1,22 +1,26 @@
 //! Commands that need server state: list-keys lines, next-attention, blocked toast,
-//! first-attach hint, debug-frame hooks and the confirm-before prompts.
+//! first-attach hint, debug-frame hooks and the confirm-before prompts. Texts shown in the TUI
+//! take the client's language; the headless replies (`next-attention` from the CLI) stay English.
 use super::*;
 use crate::api::{Status, pane_id_str};
 use crate::copy::CopyState;
+use crate::i18n::{Lang, tr, trf};
 use crate::render::{Frame, render_client};
 use crate::server::{Client, Message, Prompt, PromptKind, State};
 use crate::theme::{ClientEnv, Theme};
+use std::fmt::Display;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 /// Key bindings as `list-keys` and the `debug-frame --popup` hook show them.
-pub fn key_lines(st: &State) -> Vec<String> {
+pub fn key_lines(st: &State, lang: Lang) -> Vec<String> {
     let mut lines = vec![
-        format!(
-            "prefix = {}   (j/k/Space scroll, q closes)",
-            st.cfg.prefix_name()
+        trf(
+            lang,
+            "messages.key_header",
+            &[("prefix", &st.cfg.prefix_name() as &dyn Display)],
         ),
         String::new(),
     ];
@@ -62,6 +66,18 @@ fn pane_status(st: &State, pid: usize) -> Status {
         .map_or(Status::Idle, |p| crate::api::agent::status(p, &st.cfg))
 }
 
+/// Display word of a status in the client's language. The API keeps the English `as_str` values.
+pub fn status_word(lang: Lang, status: Status) -> &'static str {
+    let key = match status {
+        Status::Idle => "messages.status.idle",
+        Status::Working => "messages.status.working",
+        Status::Blocked => "messages.status.blocked",
+        Status::Done => "messages.status.done",
+        Status::Unknown => "messages.status.unknown",
+    };
+    tr(lang, key)
+}
+
 /// Name shown for a pane: agent name, agent kind, label, then window name (as the sidebar does).
 pub fn pane_who(st: &State, pid: usize) -> String {
     let Some(p) = st.panes.get(&pid) else {
@@ -98,11 +114,12 @@ fn agent_note(st: &State, pid: usize) -> String {
         .unwrap_or_default()
 }
 
-/// `▲ claude 0.1 blocked: need approval`, glyph and all, from the client's theme.
-pub fn attention_text(st: &State, pid: usize, status: Status, theme: &Theme) -> String {
+/// `▲ claude 0.1 blocked: need approval`, glyph and all, from the client's theme and language.
+pub fn attention_text(st: &State, pid: usize, status: Status, theme: &Theme, lang: Lang) -> String {
     let place = pane_place(st, pid).map(|(_, wi, pi)| (wi, pi));
     attention_line(
         theme,
+        lang,
         status,
         &pane_who(st, pid),
         place,
@@ -113,6 +130,7 @@ pub fn attention_text(st: &State, pid: usize, status: Status, theme: &Theme) -> 
 /// Pure form of `attention_text`; `place` is (window, pane) and `note` the `: message` part.
 pub fn attention_line(
     theme: &Theme,
+    lang: Lang,
     status: Status,
     who: &str,
     place: Option<(usize, usize)>,
@@ -124,12 +142,12 @@ pub fn attention_line(
     format!(
         "{} {who}{place} {}{note}",
         theme.status(status).0,
-        status.as_str()
+        status_word(lang, status)
     )
 }
 
 /// Headless `next-attention` (CLI, no client): origin is the most recent session's focused pane.
-/// Returns `pN blocked`/`pN done` and focuses the pane.
+/// Returns `pN blocked`/`pN done` and focuses the pane. Stays English: scripts parse it.
 pub fn headless_attention(st: &mut State, backward: bool) -> Result<String, String> {
     let si = st.target_session(None)?;
     let origin = st.active_pane(si);
@@ -164,32 +182,51 @@ pub fn notify_blocked(st: &mut State, pid: usize) {
         .map(|(id, _)| *id)
         .collect();
     for cid in cids {
-        // each client gets its own glyph set (Unicode or ASCII)
+        // each client gets its own glyph set (Unicode or ASCII) and language
         let theme = st.client_theme(cid);
-        let text = blocked_toast(&theme, &who, &session, wi, pi, &note, &prefix);
+        let lang = st.client_lang(cid);
+        let text = blocked_toast(&theme, lang, &who, (&session, wi, pi), &note, &prefix);
         st.message(cid, text);
     }
 }
 
 /// Blocked-pane toast: `▲ claude blocked in work 1.2: need approval (C-b Tab)`.
+/// `at` is (session, window index, pane index).
 pub fn blocked_toast(
     theme: &Theme,
+    lang: Lang,
     who: &str,
-    session: &str,
-    wi: usize,
-    pi: usize,
+    at: (&str, usize, usize),
     note: &str,
     prefix: &str,
 ) -> String {
-    format!(
-        "{} {who} blocked in {session} {wi}.{pi}{note} ({prefix} Tab)",
-        theme.g.blocked
-    )
+    let (session, wi, pi) = at;
+    let text = trf(
+        lang,
+        "messages.blocked_toast",
+        &[
+            ("who", &who as &dyn Display),
+            ("session", &session),
+            ("wi", &wi),
+            ("pi", &pi),
+            ("note", &note),
+            ("prefix", &prefix),
+        ],
+    );
+    format!("{} {text}", theme.g.blocked)
 }
 
 /// Notice for a client moved off a session that ended.
-pub fn session_ended_text(theme: &Theme, session: &str, other: &str) -> String {
-    format!("session {session} ended {} now in {other}", theme.g.dash)
+pub fn session_ended_text(theme: &Theme, lang: Lang, session: &str, other: &str) -> String {
+    trf(
+        lang,
+        "messages.session_ended",
+        &[
+            ("session", &session as &dyn Display),
+            ("dash", &theme.g.dash),
+            ("other", &other),
+        ],
+    )
 }
 
 static ATTACHED: AtomicBool = AtomicBool::new(false);
@@ -203,21 +240,25 @@ pub fn first_attach() -> bool {
 /// stay visible for 8 s.
 pub fn attach_hint(st: &mut State, cid: usize) {
     let p = st.cfg.prefix_name();
-    let text = attach_hint_text(&st.client_theme(cid), &p);
+    let text = attach_hint_text(&st.client_theme(cid), st.client_lang(cid), &p);
     if let Some(c) = st.clients.get_mut(&cid) {
         c.message = Some(Message {
             text,
             at: Instant::now() + Duration::from_secs(5),
             error: false,
+            ok: false,
         });
     }
     st.mark_dirty();
 }
 
 /// `C-b ? keys · C-b a agents · C-b Tab next alert`; the separator comes from the theme.
-pub fn attach_hint_text(theme: &Theme, prefix: &str) -> String {
-    let dot = theme.g.dot;
-    format!("{prefix} ? keys {dot} {prefix} a agents {dot} {prefix} Tab next alert")
+pub fn attach_hint_text(theme: &Theme, lang: Lang, prefix: &str) -> String {
+    trf(
+        lang,
+        "messages.attach_hint",
+        &[("prefix", &prefix as &dyn Display), ("dot", &theme.g.dot)],
+    )
 }
 
 fn chooser_index(st: &State, si: usize) -> usize {
@@ -229,7 +270,8 @@ fn chooser_index(st: &State, si: usize) -> usize {
 }
 
 /// `debug-frame`: render the target session with a throwaway client whose fields the flags set.
-/// Without flags this is the plain ANSI frame; `--text` returns `rows` plain lines.
+/// Without flags this is the plain ANSI frame; `--text` returns `rows` plain lines. `--lang`
+/// sets the throwaway client's language; without it the config's language applies.
 pub fn debug_frame(st: &mut State, target: Option<&str>, o: &FrameOpts) -> Result<String, String> {
     let si = st.target_session(target)?;
     let (name, cols, rows) = {
@@ -238,8 +280,9 @@ pub fn debug_frame(st: &mut State, target: Option<&str>, o: &FrameOpts) -> Resul
     };
     let default_sel = chooser_index(st, si);
     let chooser = o.chooser.map(|sel| sel.unwrap_or(default_sel));
+    let lang = o.lang.unwrap_or_else(|| Lang::resolve(&st.cfg.lang, None));
     let popup = if o.popup {
-        Some((key_lines(st), 0))
+        Some((key_lines(st, lang), 0))
     } else {
         None
     };
@@ -258,9 +301,13 @@ pub fn debug_frame(st: &mut State, target: Option<&str>, o: &FrameOpts) -> Resul
             text: text.clone(),
             at: Instant::now(),
             error: o.error,
+            ok: !o.error && (text.starts_with("copied") || text.starts_with("sourced")),
         }),
         drag: None,
-        env: ClientEnv::default(),
+        env: ClientEnv {
+            lang: o.lang,
+            ..ClientEnv::default()
+        },
     };
     // copy mode is a field of the pane; set it for this render only and put it back
     let pid = st.active_pane(si);
@@ -308,10 +355,11 @@ impl State {
     /// `next-attention` from an attached client: switch the client to the target's session
     /// and focus it.
     pub(crate) fn next_attention(&mut self, cid: usize, si: usize, backward: bool) {
+        let lang = self.client_lang(cid);
         let origin = self.active_pane(si);
         let items = attention_items(self);
         let Some((pid, status)) = pick_attention(&items, Some(origin), backward) else {
-            self.message(cid, "no pane needs attention");
+            self.message(cid, tr(lang, "messages.no_attention"));
             return;
         };
         let Some((nsi, _)) = self.locate(pid) else {
@@ -323,7 +371,7 @@ impl State {
         }
         self.focus_pane(pid);
         let theme = self.client_theme(cid);
-        let text = attention_text(self, pid, status, &theme);
+        let text = attention_text(self, pid, status, &theme, lang);
         self.message(cid, text);
     }
 
@@ -373,37 +421,67 @@ impl State {
     }
 
     /// Question for a `confirm-before` without `-p`: names the target and its agent state.
-    pub(crate) fn confirm_prompt_text(&self, si: usize, command: &str) -> Result<String, String> {
+    pub(crate) fn confirm_prompt_text(
+        &self,
+        si: usize,
+        command: &str,
+        lang: Lang,
+    ) -> Result<String, String> {
         Ok(match parse(command)? {
             Cmd::KillPane => {
                 let pid = self.active_pane(si);
-                format!(
-                    "kill pane {} ({}, {})?",
-                    pane_id_str(pid),
-                    pane_who(self, pid),
-                    pane_status(self, pid).as_str()
+                trf(
+                    lang,
+                    "messages.kill_pane",
+                    &[
+                        ("pane", &pane_id_str(pid) as &dyn Display),
+                        ("who", &pane_who(self, pid)),
+                        ("status", &status_word(lang, pane_status(self, pid))),
+                    ],
                 )
             }
             Cmd::KillWindow { target } => {
                 let (s, w) = self.window_for(Some(si), target.as_deref())?;
                 let win = &self.sessions[s].windows[w];
                 let panes = win.panes();
-                format!(
-                    "kill window {} ({}{})?",
-                    win.name,
-                    count(panes.len(), "pane"),
-                    blocked_note(self, &panes)
+                trf(
+                    lang,
+                    "messages.kill_window",
+                    &[
+                        ("name", &win.name as &dyn Display),
+                        (
+                            "count",
+                            &count(
+                                lang,
+                                panes.len(),
+                                "messages.count.pane.one",
+                                "messages.count.pane.other",
+                            ),
+                        ),
+                        ("blocked", &blocked_note(self, lang, &panes)),
+                    ],
                 )
             }
             Cmd::KillSession { target } => {
                 let s = self.kill_session_target(si, target.as_deref())?;
                 let sess = &self.sessions[s];
                 let panes: Vec<usize> = sess.windows.iter().flat_map(|w| w.panes()).collect();
-                format!(
-                    "kill session {} ({}{})?",
-                    sess.name,
-                    count(sess.windows.len(), "window"),
-                    blocked_note(self, &panes)
+                trf(
+                    lang,
+                    "messages.kill_session",
+                    &[
+                        ("name", &sess.name as &dyn Display),
+                        (
+                            "count",
+                            &count(
+                                lang,
+                                sess.windows.len(),
+                                "messages.count.window.one",
+                                "messages.count.window.other",
+                            ),
+                        ),
+                        ("blocked", &blocked_note(self, lang, &panes)),
+                    ],
                 )
             }
             _ => format!("{command}?"),
@@ -487,11 +565,13 @@ pub fn kill_session_command(name: &str) -> String {
     format!("kill-session -t {}", quote(name))
 }
 
-fn count(n: usize, unit: &str) -> String {
-    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+/// `2 panes` / `1 pane` (English), `2 個窗格` (zh-TW): `one` is used when `n` is 1.
+pub(super) fn count(lang: Lang, n: usize, one: &'static str, many: &'static str) -> String {
+    let key = if n == 1 { one } else { many };
+    trf(lang, key, &[("n", &n as &dyn Display)])
 }
 
-fn blocked_note(st: &State, panes: &[usize]) -> String {
+fn blocked_note(st: &State, lang: Lang, panes: &[usize]) -> String {
     let n = panes
         .iter()
         .filter(|p| pane_status(st, **p) == Status::Blocked)
@@ -499,6 +579,122 @@ fn blocked_note(st: &State, panes: &[usize]) -> String {
     if n == 0 {
         String::new()
     } else {
-        format!(", {n} blocked")
+        trf(lang, "messages.blocked_note", &[("n", &n as &dyn Display)])
     }
+}
+
+/// Message keys whose English text shared code builds with `format!` (the parser, server state,
+/// config). The TUI shows those errors through [`localize`]; the headless CLI keeps them English.
+pub const LOCALIZED_ERRORS: &[&str] = &[
+    "messages.unknown_command",
+    "messages.err.empty_command",
+    "messages.err.usage_set",
+    "messages.err.usage_confirm",
+    "messages.err.confirm_p",
+    "messages.err.usage_bind",
+    "messages.err.usage_unbind",
+    "messages.err.resize_need",
+    "messages.err.select_window_need",
+    "messages.err.bad_window_index",
+    "messages.err.unknown_key",
+    "messages.err.empty_key",
+    "messages.err.kill_window_need",
+    "messages.err.cant_find_session",
+    "messages.err.cant_find_window",
+    "messages.err.no_sessions",
+    "messages.err.no_pane",
+    "messages.err.no_buffer",
+    "messages.err.no_such_window",
+    "messages.err.invalid_session_name",
+    "messages.err.duplicate_session",
+    "messages.err.no_config_path",
+    "messages.err.expected_number",
+    "messages.err.expected_onoff",
+    "messages.err.unknown_option",
+    "messages.err.lang_value",
+    "messages.err.pane_titles_value",
+    "messages.err.theme_value",
+    "messages.err.ascii_glyphs_value",
+    "messages.err.bind_key",
+    "messages.sourced",
+    "messages.exited",
+    "messages.session_killed",
+];
+
+/// `text` (English, built by shared code) in the client's language. English, and text that
+/// matches no template, come back unchanged; a `"; "`-joined message is translated part by part.
+pub fn localize(lang: Lang, text: &str) -> String {
+    if lang == Lang::En {
+        return text.to_string();
+    }
+    if let Some(done) = localize_one(lang, text) {
+        return done;
+    }
+    text.split("; ")
+        .map(|part| localize_one(lang, part).unwrap_or_else(|| part.to_string()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn localize_one(lang: Lang, text: &str) -> Option<String> {
+    LOCALIZED_ERRORS.iter().find_map(|&key| {
+        let caps = match_template(tr(Lang::En, key), text)?;
+        // a placeholder value may itself be a known message (`bind KEY: unknown key: x`)
+        let owned: Vec<(String, String)> = caps
+            .into_iter()
+            .map(|(name, value)| (name, localize(lang, &value)))
+            .collect();
+        let args: Vec<(&str, &dyn Display)> = owned
+            .iter()
+            .map(|(name, value)| (name.as_str(), value as &dyn Display))
+            .collect();
+        Some(trf(lang, key, &args))
+    })
+}
+
+/// One piece of an English template: literal text or a `{name}` placeholder.
+enum Seg<'a> {
+    Lit(&'a str),
+    Var(&'a str),
+}
+
+fn template_segments(template: &str) -> Vec<Seg<'_>> {
+    let mut out = vec![];
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(len) = rest[open..].find('}') else {
+            break;
+        };
+        if open > 0 {
+            out.push(Seg::Lit(&rest[..open]));
+        }
+        out.push(Seg::Var(&rest[open + 1..open + len]));
+        rest = &rest[open + len + 1..];
+    }
+    if !rest.is_empty() {
+        out.push(Seg::Lit(rest));
+    }
+    out
+}
+
+/// Match `text` against an English template and return the placeholder values. A placeholder
+/// runs up to the first occurrence of the literal after it, or to the end of the text.
+fn match_template(template: &str, text: &str) -> Option<Vec<(String, String)>> {
+    let mut rest = text;
+    let mut caps = vec![];
+    let mut segs = template_segments(template).into_iter().peekable();
+    while let Some(seg) = segs.next() {
+        match seg {
+            Seg::Lit(lit) => rest = rest.strip_prefix(lit)?,
+            Seg::Var(name) => {
+                let value = match segs.peek() {
+                    Some(Seg::Lit(next)) => &rest[..rest.find(*next)?],
+                    _ => rest,
+                };
+                caps.push((name.to_string(), value.to_string()));
+                rest = &rest[value.len()..];
+            }
+        }
+    }
+    rest.is_empty().then_some(caps)
 }

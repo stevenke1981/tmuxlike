@@ -7,6 +7,7 @@
 use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, cut};
 use crate::api::{Status, agent};
 
+use crate::i18n::{Lang, tr};
 use crate::server::{Client, Message, Prompt, PromptKind, Session, State, Window};
 use crate::theme::{Glyphs, Theme};
 use crossterm::style::Color;
@@ -19,18 +20,18 @@ use unicode_width::UnicodeWidthStr;
 const GAP: u16 = 2;
 /// Columns the left side keeps when the right block is cut to make room.
 const MIN_LEFT: u16 = 3;
-const PREFIX_CHIP: &str = " PREFIX ";
-const COPY_CHIP: &str = " COPY ";
-const COPY_HINT: &str = "hjkl move  v/V select  y copy  q quit";
-const WHICH_KEY_END: &str = " ? all  Esc cancel";
 const CONFIRM_SUFFIX: &str = " (y/n) ";
-/// Which-key entries in priority order: (label word, commands whose first bound key is shown).
+/// Which-key entries in priority order: (label catalog key, commands whose first bound key is
+/// shown).
 const WHICH_KEY_GROUPS: &[(&str, &[&str])] = &[
-    ("new", &["new-window"]),
-    ("win", &["next-window", "previous-window"]),
-    ("split", &["split-window -h", "split-window -v"]),
+    ("render.which.new", &["new-window"]),
+    ("render.which.win", &["next-window", "previous-window"]),
     (
-        "move",
+        "render.which.split",
+        &["split-window -h", "split-window -v"],
+    ),
+    (
+        "render.which.move",
         &[
             "select-pane -L",
             "select-pane -D",
@@ -38,12 +39,12 @@ const WHICH_KEY_GROUPS: &[(&str, &[&str])] = &[
             "select-pane -R",
         ],
     ),
-    ("zoom", &["resize-pane -Z"]),
-    ("kill", &["kill-pane"]),
-    ("alert", &["next-attention"]),
-    ("tree", &["choose-tree"]),
-    ("copy", &["copy-mode"]),
-    ("detach", &["detach-client"]),
+    ("render.which.zoom", &["resize-pane -Z"]),
+    ("render.which.kill", &["kill-pane"]),
+    ("render.which.alert", &["next-attention"]),
+    ("render.which.tree", &["choose-tree"]),
+    ("render.which.copy", &["copy-mode"]),
+    ("render.which.detach", &["detach-client"]),
 ];
 
 /// Foreground, background and attributes of one styled run.
@@ -152,6 +153,13 @@ pub(crate) struct StatusInput {
     pub active: usize,
     pub ellipsis: &'static str,
     pub right: Right,
+    /// UI language of the client the row is drawn for
+    pub lang: Lang,
+}
+
+/// Language the status row of client `c` is drawn in.
+fn client_lang(st: &State, c: &Client) -> Lang {
+    Lang::resolve(&st.cfg.lang, c.env.lang)
 }
 
 /// A piece of text with a style role; `win` marks a clickable window label.
@@ -192,7 +200,7 @@ pub(crate) fn message_glyph(msg: &Message, g: &Glyphs) -> Glyph {
             tone: Tone::Err,
         };
     }
-    if msg.text.starts_with("copied") || msg.text.starts_with("sourced") {
+    if msg.ok {
         return Glyph {
             text: g.ok,
             tone: Tone::Ok,
@@ -243,6 +251,7 @@ pub fn status_hit(s: &Session, col: u16) -> Option<usize> {
         active: s.active,
         ellipsis: crate::theme::UNICODE.ellipsis,
         right: Right::None,
+        lang: Lang::En,
     };
     hit_at(&status_layout(&inp, s.cols).hits, col)
 }
@@ -465,8 +474,8 @@ fn session_cut(inp: &StatusInput, lo: usize, hi: usize, budget: u16) -> Vec<Unit
 
 fn right_block(inp: &StatusInput, w: u16, left_w: u16) -> (Vec<Unit>, u16) {
     match &inp.right {
-        Right::Bar { counts, tail } => bar_right(counts, tail, w, left_w),
-        Right::Copy => copy_right(w, left_w, inp.ellipsis),
+        Right::Bar { counts, tail } => bar_right(counts, tail, w, left_w, inp.lang),
+        Right::Copy => copy_right(w, left_w, inp.ellipsis, inp.lang),
         Right::Message { glyph, text } => message_right(*glyph, text, w, left_w, inp.ellipsis),
         Right::None => (vec![], GAP),
     }
@@ -490,8 +499,8 @@ fn cut_ok(units: &[Unit], gap: u16, w: u16) -> bool {
 /// Right block for the bar. The first alternative that fits with the left side uncut wins;
 /// otherwise the left side is cut, keeping the first alternative without the help text.
 /// The empty alternative is only used when no key hint fits beside the minimal left side.
-fn bar_right(counts: &[Count], tail: &Tail, w: u16, left_w: u16) -> (Vec<Unit>, u16) {
-    let alts = bar_alts(counts_unit(counts), tail);
+fn bar_right(counts: &[Count], tail: &Tail, w: u16, left_w: u16, lang: Lang) -> (Vec<Unit>, u16) {
+    let alts = bar_alts(counts_unit(counts), tail, lang);
     let shown = || alts.iter().filter(|a| !a.units.is_empty());
     if let Some(a) = shown().find(|a| fits_uncut(left_w, &a.units, GAP, w)) {
         return (a.units.clone(), GAP);
@@ -503,9 +512,10 @@ fn bar_right(counts: &[Count], tail: &Tail, w: u16, left_w: u16) -> (Vec<Unit>, 
 }
 
 /// Right-block alternatives in the order they are dropped: help text, counts, key hint.
-fn bar_alts(counts: Option<Unit>, tail: &Tail) -> Vec<Alt> {
+fn bar_alts(counts: Option<Unit>, tail: &Tail, lang: Lang) -> Vec<Alt> {
+    let help = tr(lang, "render.status.help");
     let options: Vec<(String, bool)> = match tail {
-        Tail::Help(k) => vec![(format!(" {k} ? help"), true), (format!(" {k}"), false)],
+        Tail::Help(k) => vec![(format!(" {k} {help}"), true), (format!(" {k}"), false)],
         Tail::Key(k) => vec![(format!(" {k}"), false)],
     };
     let key_only = options.last().map(|(t, _)| t.clone()).unwrap_or_default();
@@ -545,9 +555,9 @@ fn counts_unit(counts: &[Count]) -> Option<Unit> {
     Some(Unit { parts, win: None })
 }
 
-fn copy_right(w: u16, left_w: u16, ell: &str) -> (Vec<Unit>, u16) {
-    let chip = Unit::new(COPY_CHIP, Tone::Warn);
-    let hint = format!(" {COPY_HINT}");
+fn copy_right(w: u16, left_w: u16, ell: &str, lang: Lang) -> (Vec<Unit>, u16) {
+    let chip = Unit::new(tr(lang, "render.status.copy_chip"), Tone::Warn);
+    let hint = format!(" {}", tr(lang, "render.status.copy_hint"));
     let full = vec![chip.clone(), Unit::new(hint.clone(), Tone::Muted)];
     if fits_uncut(left_w, &full, 0, w) {
         return (full, 0);
@@ -646,12 +656,12 @@ pub(super) fn draw_status(g: &mut Grid, cx: &Ctx) -> Option<(u16, u16)> {
         let segs = [
             Seg {
                 x: 0,
-                text: which_key(&cx.st.bindings, cx.w),
+                text: which_key(&cx.st.bindings, cx.w, cx.lang),
                 tone: Tone::Bar,
             },
             Seg {
                 x: 0,
-                text: PREFIX_CHIP.to_string(),
+                text: tr(cx.lang, "render.status.prefix_chip").to_string(),
                 tone: Tone::Warn,
             },
         ];
@@ -706,6 +716,7 @@ fn status_input(st: &State, s: &Session, c: &Client, theme: &Theme) -> StatusInp
         active: s.active,
         ellipsis: theme.g.ellipsis,
         right: right_of(st, s, c, theme),
+        lang: client_lang(st, c),
     }
 }
 

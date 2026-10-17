@@ -1,7 +1,9 @@
 //! Pane contents (vt100 cells, copy-mode label, cursor), pane title rows, and the separators
 //! between panes (ui-spec §3.1, §3.4, UI-03, UI-11).
+use super::overlay::status_word;
 use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, ITALIC, UNDER, cut};
 use crate::api::{AgentInfo, pane_id_str};
+use crate::i18n::{Lang, tr, trf};
 use crate::layout::Rect;
 use crate::theme::Theme;
 use crossterm::style::Color;
@@ -79,11 +81,11 @@ pub(super) fn draw_panes(g: &mut Grid, cx: &Ctx, covered: &mut [bool]) -> Option
             }
         }
         if let Some(cs) = &p.copy {
-            let label = format!(
-                "[copy {}/{}{}]",
+            let label = copy_label(
+                cx.lang,
                 screen.scrollback(),
                 st.cfg.scrollback,
-                if cs.anchor.is_some() { " sel" } else { "" }
+                cs.anchor.is_some(),
             );
             let lx = r.x + r.w.saturating_sub(label.width() as u16);
             let theme = &cx.theme;
@@ -113,8 +115,28 @@ pub(super) fn draw_panes(g: &mut Grid, cx: &Ctx, covered: &mut [bool]) -> Option
     cursor_pos
 }
 
-/// Name shown in a pane title: agent name, else agent kind, else the user label.
-pub(crate) fn title_name<'a>(agent: Option<&'a AgentInfo>, label: Option<&'a str>) -> &'a str {
+/// Copy-mode label `[copy pos/max sel]` (`[複製 pos/max 選取]`): `pos` lines back in the
+/// scrollback of `max`, with the selection tag while a selection is anchored.
+fn copy_label(lang: Lang, pos: usize, max: usize, selecting: bool) -> String {
+    let sel = if selecting {
+        tr(lang, "render.copy.sel")
+    } else {
+        ""
+    };
+    trf(
+        lang,
+        "render.copy.label",
+        &[("pos", &pos), ("max", &max), ("sel", &sel)],
+    )
+}
+
+/// Name shown in a pane title: agent name, else agent kind, else the user label, else a
+/// translated `pane` placeholder.
+pub(crate) fn title_name<'a>(
+    agent: Option<&'a AgentInfo>,
+    label: Option<&'a str>,
+    lang: Lang,
+) -> &'a str {
     agent
         .and_then(|a| {
             a.name
@@ -123,7 +145,7 @@ pub(crate) fn title_name<'a>(agent: Option<&'a AgentInfo>, label: Option<&'a str
                 .or(Some(a.agent.as_str()).filter(|n| !n.is_empty()))
         })
         .or(label.filter(|l| !l.is_empty()))
-        .unwrap_or("pane")
+        .unwrap_or(tr(lang, "render.pane.untitled"))
 }
 
 /// Left part of a pane title: ` glyph name · word `, with the theme's dot separator.
@@ -171,8 +193,10 @@ fn draw_titles(g: &mut Grid, cx: &Ctx, covered: &mut [bool]) {
         let Some(p) = cx.st.panes.get(&pid) else {
             continue;
         };
-        let (glyph, _, word) = theme.status(crate::api::agent::status(p, &cx.st.cfg));
-        let name = title_name(p.agent.as_ref(), p.label.as_deref());
+        let state = crate::api::agent::status(p, &cx.st.cfg);
+        let (glyph, _, _) = theme.status(state);
+        let word = status_word(cx.lang, state);
+        let name = title_name(p.agent.as_ref(), p.label.as_deref(), cx.lang);
         let left = title_left(theme, glyph, name, word);
         let right = format!("{} ", pane_id_str(pid));
         let (left, right) = fit_title(&left, &right, r.w, theme.g.ellipsis);
@@ -572,11 +596,26 @@ mod tests {
             name: Some("reviewer".into()),
             resume: vec![],
         };
-        assert_eq!(title_name(Some(&a), Some("lab")), "reviewer");
+        assert_eq!(title_name(Some(&a), Some("lab"), Lang::En), "reviewer");
         a.name = None;
-        assert_eq!(title_name(Some(&a), Some("lab")), "claude");
+        assert_eq!(title_name(Some(&a), Some("lab"), Lang::En), "claude");
         a.agent = String::new();
-        assert_eq!(title_name(Some(&a), Some("lab")), "lab");
-        assert_eq!(title_name(None, None), "pane");
+        assert_eq!(title_name(Some(&a), Some("lab"), Lang::En), "lab");
+        assert_eq!(title_name(None, None, Lang::En), "pane");
+    }
+    #[test]
+    fn zh_tw_copy_label_and_untitled_name() {
+        assert_eq!(copy_label(Lang::En, 3, 2000, true), "[copy 3/2000 sel]");
+        assert_eq!(copy_label(Lang::ZhTw, 3, 2000, true), "[複製 3/2000 選取]");
+        assert_eq!(copy_label(Lang::ZhTw, 0, 2000, false), "[複製 0/2000]");
+        assert_eq!(title_name(None, None, Lang::ZhTw), "窗格");
+        assert_eq!(title_name(None, Some("lab"), Lang::ZhTw), "lab");
+    }
+
+    #[test]
+    fn zh_tw_pane_state_word_is_the_glossary_term() {
+        assert_eq!(status_word(Lang::ZhTw, Status::Working), "執行中");
+        assert_eq!(status_word(Lang::ZhTw, Status::Blocked), "待回應");
+        assert_eq!(status_word(Lang::En, Status::Done), "done");
     }
 }

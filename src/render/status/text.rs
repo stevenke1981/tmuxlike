@@ -1,6 +1,7 @@
 //! Pure text helpers for the status row: width-safe cuts, which-key line, prompt view.
-use super::{CONFIRM_SUFFIX, PREFIX_CHIP, WHICH_KEY_END, WHICH_KEY_GROUPS};
+use super::{CONFIRM_SUFFIX, WHICH_KEY_GROUPS};
 use crate::commands::tokenize;
+use crate::i18n::{Lang, tr};
 use crate::render::cut;
 use std::collections::BTreeMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -48,18 +49,20 @@ pub(super) fn runs(value: &str, want: &[String]) -> bool {
 
 /// Which-key bar shown while the prefix is pending: `PREFIX` chip, then `key label` pairs in
 /// priority order (a pair that does not fit is dropped), then the reserved right end. The
-/// result is exactly `width` columns when it fits.
-pub(super) fn which_key(bindings: &BTreeMap<String, String>, width: u16) -> String {
+/// result is exactly `width` columns when it fits. The end text is kept whole as long as
+/// `width` covers the chip and the end; narrower bars are cut as before.
+pub(super) fn which_key(bindings: &BTreeMap<String, String>, width: u16, lang: Lang) -> String {
     let width = width as usize;
-    let room = width.saturating_sub(WHICH_KEY_END.width());
-    let mut line = PREFIX_CHIP.to_string();
+    let end = tr(lang, "render.which.end");
+    let room = width.saturating_sub(end.width());
+    let mut line = tr(lang, "render.status.prefix_chip").to_string();
     let mut pairs = 0;
-    for (word, cmds) in WHICH_KEY_GROUPS {
+    for (word_key, cmds) in WHICH_KEY_GROUPS {
         let keys: Vec<&str> = cmds.iter().filter_map(|c| key_for(bindings, c)).collect();
         if keys.is_empty() {
             continue;
         }
-        let label = format!("{} {}", keys.join("/"), word);
+        let label = format!("{} {}", keys.join("/"), tr(lang, word_key));
         let sep = if pairs == 0 { "" } else { "  " };
         if line.width() + sep.width() + label.width() <= room {
             line.push_str(sep);
@@ -69,7 +72,7 @@ pub(super) fn which_key(bindings: &BTreeMap<String, String>, width: u16) -> Stri
     }
     let pad = room.saturating_sub(line.width());
     line.push_str(&" ".repeat(pad));
-    line.push_str(WHICH_KEY_END);
+    line.push_str(end);
     cut(&line, width, "")
 }
 

@@ -38,6 +38,8 @@ pub struct Config {
     pub pane_titles: String,
     /// Colors and glyphs (`[theme]` table)
     pub theme: crate::theme::ThemeCfg,
+    /// UI language: auto (from each client's locale) | en | zh-TW
+    pub lang: String,
 }
 
 impl Default for Config {
@@ -60,6 +62,7 @@ impl Default for Config {
             confirm_close: true,
             pane_titles: "auto".into(),
             theme: crate::theme::ThemeCfg::default(),
+            lang: "auto".into(),
         }
     }
 }
@@ -160,6 +163,13 @@ impl Config {
             "osc52" | "set-clipboard" => self.osc52 = parse_bool(val)?,
             "persist" => self.persist = parse_bool(val)?,
             "hints" => self.hints = parse_bool(val)?,
+            "lang" | "language" => match val {
+                "auto" => self.lang = "auto".into(),
+                v => match crate::i18n::Lang::from_locale(v) {
+                    Some(l) => self.lang = l.code().into(),
+                    None => return Err(format!("lang: expected auto|en|zh-TW, got {v}")),
+                },
+            },
             "confirm-close" => self.confirm_close = parse_bool(val)?,
             "pane-titles" => match val {
                 "off" | "auto" | "always" => self.pane_titles = val.to_string(),

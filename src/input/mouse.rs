@@ -6,8 +6,8 @@
 use crate::copy::{self, CopyState};
 use crate::layout::Rect;
 use crate::render::{
-    SidebarKind, pack_chooser, sidebar_rows, sidebar_text_width, status_hit_at, status_regions,
-    unpack_chooser, visible_entries,
+    SidebarKind, pack_chooser, sidebar_rows_lang, sidebar_text_width, status_hit_at,
+    status_regions, unpack_chooser, visible_entries,
 };
 use crate::server::State;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -93,7 +93,7 @@ impl State {
             return false;
         }
         let tw = sidebar_text_width(self, s);
-        let target = sidebar_rows(self, s, tw, s.rows)
+        let target = sidebar_rows_lang(self, s, tw, s.rows, self.client_lang(cid))
             .into_iter()
             .find(|r| r.y == row);
         match target {

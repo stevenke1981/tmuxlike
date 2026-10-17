@@ -1,9 +1,13 @@
 //! Keyboard input: overlays (popup, chooser, prompt), the prefix key, and pane pass-through.
 use crate::commands::{self, Cmd, key_name};
+use crate::i18n::{Lang, tr, trf};
 use crate::keys;
-use crate::render::{Entry, Filter, kill_target, pack_chooser, unpack_chooser, visible_entries};
+use crate::render::{
+    Entry, Filter, kill_target_lang, pack_chooser, unpack_chooser, visible_entries,
+};
 use crate::server::{Prompt, PromptKind, Shared, State};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::fmt::Display;
 
 /// Prompt history length (`State.history`, oldest first).
 const HISTORY_MAX: usize = 50;
@@ -67,7 +71,8 @@ impl State {
             None => {
                 let prefix = self.cfg.prefix_name();
                 let key = name.unwrap_or_else(|| "key".into());
-                self.error_message(cid, unbound_message(&prefix, &key));
+                let lang = self.client_lang(cid);
+                self.error_message(cid, unbound_message(lang, &prefix, &key));
             }
         }
     }
@@ -174,8 +179,9 @@ impl State {
 
     /// `x` on a chooser row: ask first when `confirm-close` is on, otherwise run the kill now.
     fn chooser_kill(&mut self, shared: &Shared, cid: usize, e: Entry) {
-        let Some(target) = kill_target(self, e) else {
-            self.message(cid, "panes close with C-b x (kill-pane)");
+        let Some(target) = kill_target_lang(self, e, self.client_lang(cid)) else {
+            let lang = self.client_lang(cid);
+            self.message(cid, tr(lang, "messages.pane_close_hint"));
             return;
         };
         if self.cfg.confirm_close {
@@ -215,12 +221,13 @@ impl State {
         };
         let yes = matches!(k.code, KeyCode::Char('y' | 'Y')) && plain_key(k);
         let expect = p.expect_pane;
+        let lang = self.client_lang(cid);
         match (yes, p.pending) {
             (true, Some(_)) if !self.is_expected_pane(cid, expect) => {
-                self.error_message(cid, "target changed - not killed");
+                self.error_message(cid, tr(lang, "messages.target_changed"));
             }
             (true, Some(cmd)) => self.run_reporting(shared, cid, &cmd),
-            _ => self.message(cid, "cancelled"),
+            _ => self.message(cid, tr(lang, "messages.cancelled")),
         }
     }
 
@@ -301,7 +308,8 @@ impl State {
     /// Run a command line; a failure is shown as an error (run_line shows it as info).
     fn run_reporting(&mut self, shared: &Shared, cid: usize, line: &str) {
         if let Err(e) = commands::parse(line).and_then(|c| self.exec(shared, cid, c)) {
-            self.error_message(cid, e);
+            let text = commands::localize(self.client_lang(cid), &e);
+            self.error_message(cid, text);
         }
     }
 }
@@ -313,8 +321,12 @@ fn plain_key(k: &KeyEvent) -> bool {
 }
 
 /// Message for a key after the prefix that has no binding (UX-04).
-fn unbound_message(prefix: &str, key: &str) -> String {
-    format!("{prefix} {key} is not bound ({prefix} ? lists keys)")
+fn unbound_message(lang: Lang, prefix: &str, key: &str) -> String {
+    trf(
+        lang,
+        "messages.unbound",
+        &[("prefix", &prefix as &dyn Display), ("key", &key)],
+    )
 }
 
 /// New popup offset for a scroll key; `None` when the key does not scroll.
@@ -601,9 +613,11 @@ mod tests {
     #[test]
     fn unbound_notice_uses_prefix_and_key_names() {
         assert_eq!(
-            unbound_message("C-b", "Q"),
+            unbound_message(Lang::En, "C-b", "Q"),
             "C-b Q is not bound (C-b ? lists keys)"
         );
+        let zh = unbound_message(Lang::ZhTw, "C-b", "Q");
+        assert_eq!(zh, "C-b Q 未綁定（C-b ? 列出按鍵）");
     }
 
     #[test]

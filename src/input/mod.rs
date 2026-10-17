@@ -12,7 +12,8 @@ use std::time::Instant;
 impl State {
     pub(crate) fn run_line(&mut self, shared: &Shared, cid: usize, line: &str) {
         if let Err(e) = commands::parse(line).and_then(|c| self.exec(shared, cid, c)) {
-            self.message(cid, e);
+            let text = commands::localize(self.client_lang(cid), &e);
+            self.message(cid, text);
         }
     }
 

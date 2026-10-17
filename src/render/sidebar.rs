@@ -2,9 +2,11 @@
 //!
 //! Layout is pure: [`sidebar_rows`] decides what each line shows. The drawer and the mouse
 //! handler both use it, so a click always lands on the line that was drawn.
+use super::overlay::status_word;
 use super::{BOLD, Cell, Ctx, DIM, Grid, cut};
 use crate::api::Status;
 use crate::api::agent::status as agent_status;
+use crate::i18n::{Lang, tr, trf};
 use crate::server::{Session, State};
 use crate::theme::{Theme, UNICODE};
 use crossterm::style::Color;
@@ -27,10 +29,10 @@ const GAP_MIN_LIST: u16 = 6;
 /// Empty-state hint is wrapped to at most this many lines.
 const EMPTY_LINES: usize = 3;
 const LEGEND: [(Status, &str); 4] = [
-    (Status::Working, "work"),
-    (Status::Blocked, "block"),
-    (Status::Done, "done"),
-    (Status::Idle, "idle"),
+    (Status::Working, "render.legend.working"),
+    (Status::Blocked, "render.legend.blocked"),
+    (Status::Done, "render.legend.done"),
+    (Status::Idle, "render.legend.idle"),
 ];
 /// Footer layouts, richest first: (legend, hint). The legend has a blank line above it.
 const FOOTER_WITH_HINT: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
@@ -90,11 +92,16 @@ pub fn sidebar_text_width(st: &State, s: &Session) -> u16 {
         .saturating_sub(TEXT_INSET + RIGHT_GUTTER)
 }
 
-/// Lines the sidebar draws for session `s` in a `height`-row client (the last row is the
-/// status bar). `width` is [`sidebar_text_width`].
-pub fn sidebar_rows(st: &State, s: &Session, width: u16, height: u16) -> Vec<SidebarRow> {
+/// [`sidebar_rows`] for a client whose UI language is `lang`.
+pub fn sidebar_rows_lang(
+    st: &State,
+    s: &Session,
+    width: u16,
+    height: u16,
+    lang: Lang,
+) -> Vec<SidebarRow> {
     let groups = group_views(st, s);
-    layout_rows(&groups, any_agent(st), st.cfg.hints, width, height)
+    layout_rows(&groups, any_agent(st), st.cfg.hints, width, height, lang)
 }
 
 fn any_agent(st: &State) -> bool {
@@ -175,6 +182,7 @@ fn layout_rows(
     hints: bool,
     width: u16,
     height: u16,
+    lang: Lang,
 ) -> Vec<SidebarRow> {
     let avail = height.saturating_sub(1);
     if width == 0 || avail == 0 {
@@ -189,7 +197,7 @@ fn layout_rows(
     }
     let top = if list_h >= GAP_MIN_LIST { 2 } else { 1 };
     let room = list_h.saturating_sub(top) as usize;
-    let list = fit_list(groups, any_agent, hints, width, room);
+    let list = fit_list(groups, any_agent, hints, width, room, lang);
     for (i, mut it) in list.into_iter().enumerate() {
         it.y = top + i as u16;
         rows.push(it);
@@ -207,11 +215,12 @@ fn fit_list(
     hints: bool,
     width: u16,
     room: usize,
+    lang: Lang,
 ) -> Vec<SidebarRow> {
     if room == 0 {
         return vec![];
     }
-    let flat = list_items(groups, any_agent, hints, width);
+    let flat = list_items(groups, any_agent, hints, width, lang);
     let all = vec![true; flat.len()];
     if lines(&flat, &all) <= room {
         return assemble(&flat, &all);
@@ -410,10 +419,18 @@ fn push_footer(rows: &mut Vec<SidebarRow>, avail: u16, legend: bool, hint: bool)
 }
 
 /// Every row above the footer, in draw order, without blank spacers (see [`fit_list`]).
-fn list_items(groups: &[GroupView], any_agent: bool, hints: bool, width: u16) -> Vec<SidebarRow> {
+fn list_items(
+    groups: &[GroupView],
+    any_agent: bool,
+    hints: bool,
+    width: u16,
+    lang: Lang,
+) -> Vec<SidebarRow> {
     let mut items = vec![];
     if hints && !any_agent {
-        let n = empty_lines(width, UNICODE.dash).len().min(EMPTY_LINES);
+        let n = empty_lines(width, UNICODE.dash, lang)
+            .len()
+            .min(EMPTY_LINES);
         items.extend((0..n).map(|i| item(SidebarKind::Empty(i), None, None)));
     }
     for g in groups {
@@ -434,9 +451,9 @@ fn list_items(groups: &[GroupView], any_agent: bool, hints: bool, width: u16) ->
 
 /// Empty-state hint. `dash` is `theme.g.dash` (an em dash, or `-` in ASCII mode). Both are one
 /// column wide, so the wrapped line count does not depend on the glyph set.
-fn empty_lines(width: u16, dash: &str) -> Vec<String> {
+fn empty_lines(width: u16, dash: &str, lang: Lang) -> Vec<String> {
     wrap(
-        &format!("no agent reports {dash} see: tmuxlike pane report-agent --help"),
+        &trf(lang, "render.sidebar.empty", &[("dash", &dash)]),
         width,
     )
 }
@@ -497,11 +514,12 @@ fn counts(panes: &[PaneView]) -> Vec<(Status, usize)> {
 }
 
 /// Legend such as `●work ▲block ◆done ○idle`, or `● work ▲ block ◆ done ○ idle` when it fits.
-fn legend_text(t: &Theme, spaced: bool) -> String {
+fn legend_text(t: &Theme, spaced: bool, lang: Lang) -> String {
     LEGEND
         .iter()
-        .map(|(s, word)| {
+        .map(|(s, word_key)| {
             let glyph = t.status(*s).0;
+            let word = tr(lang, word_key);
             if spaced {
                 format!("{glyph} {word}")
             } else {
@@ -512,8 +530,8 @@ fn legend_text(t: &Theme, spaced: bool) -> String {
         .join(" ")
 }
 
-fn hint_text(prefix: &str) -> String {
-    format!("{prefix} a hide  {prefix} s switch")
+fn hint_text(prefix: &str, lang: Lang) -> String {
+    trf(lang, "render.sidebar.hint", &[("prefix", &prefix)])
 }
 
 /// Attribute for muted chrome: faint in mono mode (no color to tell it apart), plain otherwise.
@@ -527,6 +545,7 @@ struct Lane<'a> {
     tx: u16,
     tw: u16,
     prefix: String,
+    lang: Lang,
 }
 
 /// Draw the sidebar (if the session has room for one) along the right edge.
@@ -556,8 +575,9 @@ pub(super) fn draw_sidebar(g: &mut Grid, cx: &Ctx) {
         tx: sx + TEXT_INSET,
         tw,
         prefix: st.cfg.prefix_name(),
+        lang: cx.lang,
     };
-    for row in layout_rows(&groups, any_agent(st), st.cfg.hints, tw, h) {
+    for row in layout_rows(&groups, any_agent(st), st.cfg.hints, tw, h, cx.lang) {
         draw_row(g, &lane, &row, &groups);
     }
 }
@@ -583,7 +603,7 @@ fn draw_row(g: &mut Grid, l: &Lane, row: &SidebarRow, groups: &[GroupView]) {
                 l.tx,
                 y,
                 l.tw,
-                "agents",
+                tr(l.lang, "render.sidebar.title"),
                 l.t.c(l.t.accent),
                 Color::Reset,
                 BOLD,
@@ -613,21 +633,22 @@ fn draw_row(g: &mut Grid, l: &Lane, row: &SidebarRow, groups: &[GroupView]) {
             }
         }
         SidebarKind::Empty(i) => {
-            if let Some(line) = empty_lines(l.tw, l.t.g.dash).get(i) {
+            if let Some(line) = empty_lines(l.tw, l.t.g.dash, l.lang).get(i) {
                 let line = cut(line, tw, ell);
                 g.text(l.tx, y, l.tw, &line, muted, Color::Reset, dim);
             }
         }
         SidebarKind::More(n) => {
-            let label = cut(&format!("{ell} +{n} more"), tw, ell);
+            let more = trf(l.lang, "render.sidebar.more", &[("ell", &ell), ("n", &n)]);
+            let label = cut(&more, tw, ell);
             g.text(l.tx, y, l.tw, &label, muted, Color::Reset, dim);
         }
         SidebarKind::Legend => {
-            let text = cut(&legend_text(l.t, l.tw >= LEGEND_SPACED), tw, ell);
+            let text = cut(&legend_text(l.t, l.tw >= LEGEND_SPACED, l.lang), tw, ell);
             g.text(l.tx, y, l.tw, &text, muted, Color::Reset, dim);
         }
         SidebarKind::Hint => {
-            let text = cut(&hint_text(&l.prefix), tw, ell);
+            let text = cut(&hint_text(&l.prefix, l.lang), tw, ell);
             g.text(l.tx, y, l.tw, &text, muted, Color::Reset, dim);
         }
         SidebarKind::Gap => {}
@@ -674,7 +695,8 @@ fn draw_closed(g: &mut Grid, l: &Lane, y: u16, gr: &GroupView) {
 /// dropped when the name would get < `MIN_NAME` columns beside it.
 fn draw_pane(g: &mut Grid, l: &Lane, y: u16, p: &PaneView) {
     let t = l.t;
-    let (glyph, color, word) = t.status(p.status);
+    let (glyph, color, _) = t.status(p.status);
+    let word = status_word(l.lang, p.status);
     let (ptr, ptr_attr) = if p.focused {
         (t.g.pointer, BOLD)
     } else {

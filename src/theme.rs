@@ -39,6 +39,9 @@ pub struct ClientEnv {
     pub dumb: bool,
     /// TMUXLIKE_ASCII=1 or a non-UTF-8 locale
     pub ascii: bool,
+    /// UI language detected from the client's locale (None = not recognised)
+    #[serde(default)]
+    pub lang: Option<crate::i18n::Lang>,
 }
 
 impl ClientEnv {
@@ -56,6 +59,7 @@ impl ClientEnv {
             no_color: var("NO_COLOR").is_some(),
             dumb: var("TERM").is_some_and(|t| t == "dumb"),
             ascii: var("TMUXLIKE_ASCII").is_some_and(|v| v == "1") || (cfg!(unix) && non_utf8),
+            lang: crate::i18n::Lang::detect(),
         }
     }
 }

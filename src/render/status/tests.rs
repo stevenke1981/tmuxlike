@@ -22,6 +22,7 @@ fn input(session: &str, wins: Vec<WinItem>, active: usize, right: Right) -> Stat
         active,
         ellipsis: "…",
         right,
+        lang: Lang::En,
     }
 }
 
@@ -183,6 +184,7 @@ fn status_hit_is_computed_from_the_session_without_global_state() {
         active: 0,
         ellipsis: "…",
         right: Right::None,
+        lang: Lang::En,
     };
     let hits = status_layout(&inp, 40).hits;
     let (a0, b0) = (hits[0].1, hits[0].2);
@@ -229,6 +231,8 @@ fn msg(text: &str, error: bool) -> Message {
         text: text.into(),
         at: std::time::Instant::now(),
         error,
+        // producers mark successes with `ok_message` (copied, sourced)
+        ok: !error && (text.starts_with("copied") || text.starts_with("sourced")),
     }
 }
 
@@ -321,8 +325,8 @@ fn ascii_bar_cuts_with_the_theme_ellipsis_only() {
 
 #[test]
 fn which_key_bar_is_ascii_when_bindings_are_default() {
-    assert!(which_key(&defaults(), 80).is_ascii());
-    assert!(which_key(&defaults(), 40).is_ascii());
+    assert!(which_key(&defaults(), 80, Lang::En).is_ascii());
+    assert!(which_key(&defaults(), 40, Lang::En).is_ascii());
 }
 
 #[test]
@@ -441,7 +445,7 @@ fn copied_message_uses_ok_glyph() {
 
 #[test]
 fn which_key_width_40_keeps_the_reserved_end() {
-    let line = which_key(&defaults(), 40);
+    let line = which_key(&defaults(), 40, Lang::En);
     assert_eq!(line.width(), 40, "{line:?}");
     assert!(line.ends_with("? all  Esc cancel"), "{line:?}");
     assert!(line.starts_with(" PREFIX c new"), "{line:?}");
@@ -449,7 +453,7 @@ fn which_key_width_40_keeps_the_reserved_end() {
 
 #[test]
 fn which_key_full_line_at_120_columns() {
-    let line = which_key(&defaults(), 120);
+    let line = which_key(&defaults(), 120, Lang::En);
     let expected = format!(
         " PREFIX c new  n/p win  %/\" split  h/j/k/l move  z zoom  x kill  Tab alert  s tree  [ copy  d detach{} ? all  Esc cancel",
         " ".repeat(2)
@@ -461,7 +465,7 @@ fn which_key_full_line_at_120_columns() {
 #[test]
 fn which_key_lists_live_bindings_in_priority_order() {
     let bindings = defaults();
-    let line = which_key(&bindings, 200);
+    let line = which_key(&bindings, 200, Lang::En);
     for want in [
         "c new",
         "n/p win",
@@ -486,7 +490,7 @@ fn which_key_follows_unbinding_and_drops_alert_without_binding() {
     bindings.remove("x");
     bindings.remove("Tab");
     bindings.remove("BTab");
-    let line = which_key(&bindings, 200);
+    let line = which_key(&bindings, 200, Lang::En);
     assert!(!line.contains("x kill"), "{line:?}");
     assert!(!line.contains("alert"), "{line:?}");
 }
@@ -495,7 +499,7 @@ fn which_key_follows_unbinding_and_drops_alert_without_binding() {
 fn which_key_sees_through_confirm_before() {
     let mut bindings = BTreeMap::new();
     bindings.insert("k".into(), "confirm-before -p \"kill? \" kill-pane".into());
-    let line = which_key(&bindings, 120);
+    let line = which_key(&bindings, 120, Lang::En);
     assert!(line.contains("k kill"), "{line:?}");
 }
 
@@ -522,4 +526,102 @@ fn confirm_text_keeps_the_suffix() {
     let text = confirm_text("kill pane p2 (codex, working)?", 20, "…");
     assert!(text.ends_with(" (y/n) "), "{text:?}");
     assert!(text.width() <= 20, "{text:?}");
+}
+
+fn zh_input(session: &str, wins: Vec<WinItem>, active: usize, right: Right) -> StatusInput {
+    StatusInput {
+        lang: Lang::ZhTw,
+        ..input(session, wins, active, right)
+    }
+}
+
+#[test]
+fn zh_tw_which_key_ends_with_the_reserved_end_at_every_width() {
+    let bindings = defaults();
+    for w in 25..=120u16 {
+        let line = which_key(&bindings, w, Lang::ZhTw);
+        assert_eq!(line.width(), usize::from(w), "w={w} {line:?}");
+        assert!(line.ends_with(" ? 全部  Esc 取消"), "w={w} {line:?}");
+        assert!(line.starts_with(" 前綴鍵 "), "w={w} {line:?}");
+    }
+}
+
+#[test]
+fn zh_tw_which_key_at_80_columns_lists_whole_pairs() {
+    let line = which_key(&defaults(), 80, Lang::ZhTw);
+    // priority order: the first pairs that fit are shown whole, the rest are dropped whole
+    for want in ["c 新增", "n/p 視窗", "%/\" 分割", "h/j/k/l 移動", "z 放大"] {
+        assert!(line.contains(want), "missing {want:?} in {line:?}");
+    }
+    for gone in ["x 關閉", "Tab 提醒", "d 離開"] {
+        assert!(
+            !line.contains(gone),
+            "{gone:?} should be dropped in {line:?}"
+        );
+    }
+    assert!(line.ends_with(" ? 全部  Esc 取消"), "{line:?}");
+}
+
+#[test]
+fn zh_tw_which_key_drops_pairs_that_do_not_fit() {
+    let line = which_key(&defaults(), 40, Lang::ZhTw);
+    assert_eq!(line.width(), 40, "{line:?}");
+    assert!(line.starts_with(" 前綴鍵 c 新增"), "{line:?}");
+    assert!(line.ends_with(" ? 全部  Esc 取消"), "{line:?}");
+    // no label is cut in the middle: every word left of the end is a whole pair
+    let body = line.trim_end_matches(" ? 全部  Esc 取消").trim();
+    assert!(!body.ends_with('視') && !body.ends_with('分'), "{body:?}");
+}
+
+#[test]
+fn zh_tw_help_hint_and_counts_share_the_right_block() {
+    let counts = vec![Count {
+        glyph: "▲",
+        status: Status::Blocked,
+        n: 1,
+    }];
+    let right = Right::Bar {
+        counts,
+        tail: Tail::Help("C-b".into()),
+    };
+    let (text, _) = row(&zh_input("demo", vec![win("cmd")], 0, right), 80);
+    assert!(text.ends_with("▲1   C-b ? 說明"), "{text:?}");
+}
+
+#[test]
+fn zh_tw_right_block_is_never_overpainted_and_keeps_the_key() {
+    for w in 20..=80u16 {
+        let right = Right::Bar {
+            counts: vec![],
+            tail: Tail::Help("C-b".into()),
+        };
+        let (text, _) = row(&zh_input("demo", twelve(), 3, right), w);
+        assert!(text.width() <= usize::from(w), "w={w} {text:?}");
+        let end = text.trim_end();
+        assert!(
+            end.ends_with("C-b") || end.ends_with("C-b ? 說明"),
+            "w={w} {text:?}"
+        );
+    }
+}
+
+#[test]
+fn zh_tw_copy_mode_chip_and_hints() {
+    let (wide, _) = row(&zh_input("demo", vec![win("cmd")], 0, Right::Copy), 120);
+    assert!(
+        wide.contains(" 複製模式 ") && wide.trim_end().ends_with("y 複製  q 結束"),
+        "{wide:?}"
+    );
+    let (narrow, _) = row(&zh_input("demo", vec![win("cmd")], 0, Right::Copy), 40);
+    assert!(narrow.contains(" 複製模式 "), "{narrow:?}");
+    assert!(narrow.contains("0:cmd"), "{narrow:?}");
+}
+
+#[test]
+fn zh_tw_status_row_keeps_the_windows_when_narrow() {
+    let inp = zh_input("工作", vec![win("cmd")], 0, key_bar("C-b"));
+    let (text, hits) = row(&inp, 30);
+    assert!(text.contains("0:cmd"), "{text:?}");
+    assert!(text.width() <= 30, "{text:?}");
+    assert!(!hits.is_empty());
 }

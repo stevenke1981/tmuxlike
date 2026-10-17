@@ -405,6 +405,23 @@ Precedence: an explicit `dark`, `light` or `mono` wins over the environment; `NO
   These variables are read by the attaching client, so set them per attach, e.g. `NO_COLOR=1 tmuxlike attach -t work`. `NO_COLOR` alone does not switch to ASCII glyphs.
 - `[theme] ascii_glyphs = "true"` 或 `"false"` 會覆寫環境變數；`"auto"`（預設）才依環境變數決定。
   `ascii_glyphs = "true"` or `"false"` overrides the environment; `"auto"` (the default) follows it.
+## 語言 Language
+
+介面語言可選 `en`（英文，原始語言）與 `zh-TW`（繁體中文）。The interface is available in English (`en`, the source language) and Traditional Chinese (`zh-TW`).
+
+- 設定檔 `lang = "auto" | "en" | "zh-TW"`（預設 `auto`）；執行期可用 `set lang zh-TW` 或 `set lang en` 切換，已連線的畫面會改用新語言。
+  Config: `lang = "auto" | "en" | "zh-TW"` (default `auto`). At runtime, `set lang zh-TW` or `set lang en` switches; attached clients show the new language on their next redraw.
+- `auto` 的偵測順序：依序讀取 `LC_ALL`、`LC_MESSAGES`、`LANG`、`LANGUAGE`，第一個可辨識的值勝出；都無法辨識時，在 Windows 讀取使用者地區設定（例如 `zh-TW`）；仍無法辨識則用英文。Git Bash 等環境會設定 `LANG`，此時以 `LANG` 為準，會蓋過 Windows 地區設定。
+  Detection order for `auto`: `LC_ALL`, `LC_MESSAGES`, `LANG`, `LANGUAGE` in that order, and the first recognised value wins; if none is recognised, the Windows user locale is read (for example `zh-TW`); otherwise English. Git Bash sets `LANG`, which then wins over the Windows locale.
+- 所有 `zh` locale（`zh-CN`、`zh_SG`、`zh-Hans` 等）目前都使用 zh-TW 文字；其他語言一律使用英文。
+  Every `zh` locale (`zh-CN`, `zh_SG`, `zh-Hans`, ...) currently uses the zh-TW text; other languages use English.
+- `TMUXLIKE_LANG=en` 或 `TMUXLIKE_LANG=zh-TW` 可覆寫命令列的語言，優先於 locale 偵測。它只影響 `--help`、`keys`、`pane --help`，以及連線、離開與錯誤等客戶端訊息；TUI 畫面仍依 `lang` 設定。
+  `TMUXLIKE_LANG=en` or `TMUXLIKE_LANG=zh-TW` overrides detection for the command line. It affects only `--help`, `keys`, `pane --help` and the client's connection, exit and error messages; the TUI still follows `lang`.
+- 不翻譯的內容：JSON API 輸出（`{"result"}`、`{"error":{"code","message"}}`、狀態值如 `working`）、命令與選項名稱（`split-window`、`--direction`）、按鍵名稱（`C-b`、`Esc`）、設定鍵名與值、窗格與工作階段 ID、檔案路徑、除錯紀錄，以及用法錯誤訊息。
+  Never translated: JSON API output (`{"result"}`, `{"error":{"code","message"}}`, status values such as `working`), command, option and key names (`split-window`, `--direction`, `C-b`, `Esc`), config keys and values, pane and session IDs, file paths, log lines and usage errors.
+- 新增語言：在 `src/i18n/mod.rs` 的 `Lang` 加入變體，並補上 `code()` 與 `from_locale()` 的對應；再於 `src/i18n/catalog/*.rs` 的每個條目 `(key, en, zh-TW)` 加一欄該語言的譯文。測試會檢查 key 唯一、各欄非空，且 `{placeholder}` 在各語言中一致。
+  Adding a language: add a variant to `Lang` in `src/i18n/mod.rs` with its `code()` and `from_locale()` entries, then add one translation column to every entry `(key, en, zh-TW)` in `src/i18n/catalog/*.rs`. The tests check that keys are unique, every column is non-empty and `{placeholder}` names match across languages.
+
 ## 限制 Limitations
 
 - 視窗自動命名僅支援 Linux / macOS；Windows 使用 shell 名稱 / Automatic window naming works on Linux/macOS only; Windows uses the shell name

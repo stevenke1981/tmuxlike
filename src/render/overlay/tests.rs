@@ -108,7 +108,7 @@ fn session_row_shows_rollup_status() {
 
 #[test]
 fn last_child_uses_corner_and_others_tee() {
-    let rows = chooser_rows(&sample(), Filter::All, &UNICODE);
+    let rows = chooser_rows(&sample(), Filter::All, &UNICODE, Lang::En);
     assert_eq!(rows[1].prefix, "├ ", "cmd has a later sibling");
     assert_eq!(rows[4].prefix, "└ ", "logs is the last window");
     assert_eq!(
@@ -122,7 +122,7 @@ fn last_child_uses_corner_and_others_tee() {
 
 #[test]
 fn filtered_rows_recompute_connectors() {
-    let rows = chooser_rows(&sample(), Filter::Only(Status::Blocked), &UNICODE);
+    let rows = chooser_rows(&sample(), Filter::Only(Status::Blocked), &UNICODE, Lang::En);
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[1].prefix, "└ ", "only window left is the last one");
     assert_eq!(rows[2].prefix, "  └ ");
@@ -130,23 +130,32 @@ fn filtered_rows_recompute_connectors() {
 
 #[test]
 fn session_text_uses_plural_and_attached_tag() {
-    assert_eq!(session_text("work", 2, false), "work: 2 windows");
-    assert_eq!(session_text("solo", 1, true), "solo: 1 window (attached)");
-    assert_eq!(session_text("empty", 0, false), "empty: 0 windows");
+    assert_eq!(session_text(Lang::En, "work", 2, false), "work: 2 windows");
+    assert_eq!(
+        session_text(Lang::En, "solo", 1, true),
+        "solo: 1 window (attached)"
+    );
+    assert_eq!(
+        session_text(Lang::En, "empty", 0, false),
+        "empty: 0 windows"
+    );
 }
 
 #[test]
 fn window_and_pane_text_plurals_and_markers() {
-    assert_eq!(window_text(0, "cmd", true, 1), "0: cmd*  1 pane");
-    assert_eq!(window_text(2, "logs", false, 3), "2: logs  3 panes");
+    assert_eq!(window_text(Lang::En, 0, "cmd", true, 1), "0: cmd*  1 pane");
+    assert_eq!(
+        window_text(Lang::En, 2, "logs", false, 3),
+        "2: logs  3 panes"
+    );
     assert_eq!(pane_text(0, 1, "codex"), "0.1 codex");
-    assert_eq!(count_noun(1, "window", "windows"), "1 window");
-    assert_eq!(count_noun(0, "pane", "panes"), "0 panes");
+    assert_eq!(count_text(Lang::En, 1, Noun::Window), "1 window");
+    assert_eq!(count_text(Lang::En, 0, Noun::Pane), "0 panes");
 }
 
 #[test]
 fn row_text_for_session_window_pane() {
-    let rows = chooser_rows(&sample(), Filter::All, &UNICODE);
+    let rows = chooser_rows(&sample(), Filter::All, &UNICODE, Lang::En);
     assert_eq!(rows[0].text, "demo: 2 windows (attached)");
     assert!(rows[0].bold);
     assert_eq!(rows[0].word, None);
@@ -179,37 +188,37 @@ fn chooser_footer_in_ascii_theme_is_ascii() {
         g: ASCII,
         ..Theme::terminal()
     };
-    let footer = chooser_hints(&ascii.g);
+    let footer = chooser_hints(&ascii.g, Lang::En);
     assert!(footer.is_ascii(), "{footer:?}");
     assert!(footer.contains("esc close"));
 }
 
 #[test]
 fn ascii_chooser_rows_and_titles_stay_ascii() {
-    let rows = chooser_rows(&sample(), Filter::All, &ASCII);
+    let rows = chooser_rows(&sample(), Filter::All, &ASCII, Lang::En);
     for r in &rows {
         assert!(r.prefix.is_ascii() && r.text.is_ascii(), "{r:?}");
     }
-    assert!(chooser_title(Filter::Only(Status::Done)).is_ascii());
+    assert!(chooser_title(Lang::En, Filter::Only(Status::Done)).is_ascii());
 }
 
 #[test]
 fn kill_target_session_names_windows_and_blocked_count() {
-    let t = kill_target_in(&sample(), (0, None, None)).unwrap();
+    let t = kill_target_in(&sample(), (0, None, None), Lang::En).unwrap();
     assert_eq!(t.question, "kill session demo (2 windows, 1 blocked)?");
     assert_eq!(t.command, "kill-session -t \"demo\"");
 }
 
 #[test]
 fn kill_target_window_uses_session_colon_index() {
-    let t = kill_target_in(&sample(), (0, Some(0), None)).unwrap();
+    let t = kill_target_in(&sample(), (0, Some(0), None), Lang::En).unwrap();
     assert_eq!(t.question, "kill window 0 cmd (2 panes, 1 blocked)?");
     assert_eq!(t.command, "kill-window -t \"demo:0\"");
 }
 
 #[test]
 fn kill_target_pane_has_none() {
-    assert!(kill_target_in(&sample(), (0, Some(0), Some(0))).is_none());
+    assert!(kill_target_in(&sample(), (0, Some(0), Some(0)), Lang::En).is_none());
 }
 
 #[test]
@@ -243,19 +252,22 @@ fn filter_keys_map_and_others_do_not() {
 
 #[test]
 fn titles_show_active_filter() {
-    assert_eq!(chooser_title(Filter::All), "Sessions");
+    assert_eq!(chooser_title(Lang::En, Filter::All), "Sessions");
     assert_eq!(
-        chooser_title(Filter::Only(Status::Blocked)),
+        chooser_title(Lang::En, Filter::Only(Status::Blocked)),
         "Sessions [blocked]"
     );
-    assert_eq!(empty_note(Filter::Only(Status::Done)), "no done panes");
+    assert_eq!(
+        empty_note(Lang::En, Filter::Only(Status::Done)),
+        "no done panes"
+    );
 }
 
 #[test]
 fn footer_hints_name_the_keys_in_both_glyph_sets() {
-    let u = chooser_hints(&UNICODE);
+    let u = chooser_hints(&UNICODE, Lang::En);
     assert!(u.contains("b/w/d/i filter") && u.ends_with("esc close"));
-    assert!(!chooser_hints(&ASCII).contains('↑'));
+    assert!(!chooser_hints(&ASCII, Lang::En).contains('↑'));
 }
 
 #[test]
@@ -288,4 +300,62 @@ fn window_start_keeps_selection_visible() {
 fn window_start_clamps_scroll_without_selection() {
     assert_eq!(window_start(10, 4, None, 99), 6);
     assert_eq!(window_start(3, 4, None, 2), 0);
+}
+
+#[test]
+fn zh_tw_chooser_labels_use_glossary_terms() {
+    assert_eq!(session_text(Lang::ZhTw, "work", 2, false), "work：2 個視窗");
+    assert_eq!(
+        session_text(Lang::ZhTw, "solo", 1, true),
+        "solo：1 個視窗（已連線）"
+    );
+    assert_eq!(
+        window_text(Lang::ZhTw, 0, "cmd", true, 1),
+        "0：cmd*  1 個窗格"
+    );
+    assert_eq!(count_text(Lang::ZhTw, 3, Noun::Pane), "3 個窗格");
+    let rows = chooser_rows(&sample(), Filter::All, &UNICODE, Lang::ZhTw);
+    assert_eq!(rows[2].word, Some("待回應"));
+    assert_eq!(rows[3].word, Some("執行中"));
+    assert_eq!(rows[5].word, Some("閒置"));
+    assert_eq!(rows[0].text, "demo：2 個視窗（已連線）");
+}
+
+#[test]
+fn zh_tw_titles_filters_and_footers() {
+    assert_eq!(chooser_title(Lang::ZhTw, Filter::All), "工作階段");
+    assert_eq!(
+        chooser_title(Lang::ZhTw, Filter::Only(Status::Blocked)),
+        "工作階段 [待回應]"
+    );
+    assert_eq!(
+        empty_note(Lang::ZhTw, Filter::Only(Status::Done)),
+        "沒有已完成的窗格"
+    );
+    assert_eq!(empty_note(Lang::ZhTw, Filter::All), "沒有工作階段");
+    let footer = chooser_hints(&UNICODE, Lang::ZhTw);
+    assert!(
+        footer.contains("篩選") && footer.ends_with("關閉"),
+        "{footer}"
+    );
+    assert!(chooser_hints(&ASCII, Lang::ZhTw).contains("開啟"));
+}
+
+#[test]
+fn zh_tw_kill_questions_name_the_target_and_blocked_count() {
+    let s = kill_target_in(&sample(), (0, None, None), Lang::ZhTw).unwrap();
+    assert_eq!(s.question, "關閉工作階段 demo（2 個視窗，待回應 1）？");
+    assert_eq!(s.command, "kill-session -t \"demo\"");
+    let w = kill_target_in(&sample(), (0, Some(0), None), Lang::ZhTw).unwrap();
+    assert_eq!(w.question, "關閉視窗 0 cmd（2 個窗格，待回應 1）？");
+    assert_eq!(w.command, "kill-window -t \"demo:0\"");
+}
+
+#[test]
+fn zh_tw_scroll_markers_and_popup_chrome_are_translated() {
+    assert_eq!(tr(Lang::ZhTw, "render.scroll.up"), "▲ 更多");
+    assert_eq!(tr(Lang::ZhTw, "render.scroll.down_ascii"), "v 更多");
+    assert_eq!(tr(Lang::En, "render.scroll.up"), "▲ more");
+    assert_eq!(tr(Lang::ZhTw, "render.popup.title"), "按鍵");
+    assert_eq!(tr(Lang::ZhTw, "render.popup.hint"), "j/k 捲動  esc 關閉");
 }

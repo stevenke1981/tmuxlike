@@ -2,7 +2,7 @@
 import pyte, os, pty, time, select, base64, subprocess, fcntl, termios, struct
 CFG="/tmp/tmuxlike-e2e.toml"
 open(CFG,"w").write('shell = "bash --norc --noprofile"\n[bind]\ny = "display hello-bind"\nv = "split-window -h"\n')
-env=dict(os.environ, TMUXLIKE_SOCKET="tltest2.sock", TMUXLIKE_CONFIG=CFG, PS1="$ ", TERM="xterm-256color")
+env=dict(os.environ, TMUXLIKE_SOCKET="tltest2.sock", TMUXLIKE_CONFIG=CFG, PS1="$ ", TERM="xterm-256color", TMUXLIKE_LANG="en", LANG="C.UTF-8", LC_ALL="C.UTF-8")
 env.pop("TMUXLIKE",None)
 B=os.environ.get("TMUXLIKE_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug", "tmuxlike"))
 def cli(*a): r=subprocess.run([B,*a],env=env,capture_output=True,text=True); return r.returncode, r.stdout+r.stderr

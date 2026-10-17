@@ -192,6 +192,8 @@ pub struct Message {
     pub at: Instant,
     /// errors render with the error token and stay longer
     pub error: bool,
+    /// a success (copied, config reloaded): shown with the ok glyph; language independent
+    pub ok: bool,
 }
 
 impl Message {
@@ -380,12 +382,21 @@ impl State {
         self.set_message(cid, msg.into(), true);
     }
 
+    /// Success notice (copied, sourced): shown with the ok glyph.
+    pub(crate) fn ok_message(&mut self, cid: usize, msg: impl Into<String>) {
+        self.set_message(cid, msg.into(), false);
+        if let Some(m) = self.clients.get_mut(&cid).and_then(|c| c.message.as_mut()) {
+            m.ok = true;
+        }
+    }
+
     fn set_message(&mut self, cid: usize, text: String, error: bool) {
         if let Some(c) = self.clients.get_mut(&cid) {
             c.message = Some(Message {
                 text,
                 at: Instant::now(),
                 error,
+                ok: false,
             });
         }
         self.mark_dirty();
@@ -698,6 +709,12 @@ impl State {
         }
     }
 
+    /// UI language for client `cid` (config `lang` + its locale); English when unknown.
+    pub(crate) fn client_lang(&self, cid: usize) -> crate::i18n::Lang {
+        let env = self.clients.get(&cid).and_then(|c| c.env.lang);
+        crate::i18n::Lang::resolve(&self.cfg.lang, env)
+    }
+
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
         let _ = self.notify.send(());
@@ -759,6 +776,7 @@ impl State {
             .map(|(i, _)| *i)
             .collect();
         for id in ids {
+            let lang = self.client_lang(id);
             if let Some(o) = &other {
                 let c = self.clients.get_mut(&id).unwrap();
                 c.session = o.clone();
@@ -766,16 +784,19 @@ impl State {
                 c.message = Some(Message {
                     text: commands::session_ended_text(
                         &crate::theme::Theme::resolve(&self.cfg.theme, &c.env),
+                        lang,
                         session,
                         o,
                     ),
                     at: Instant::now(),
                     error: false,
+                    ok: false,
                 });
                 continue;
             }
             if let Some(mut c) = self.clients.remove(&id) {
-                let _ = write_msg(&mut c.sender, &ServerMsg::Exit(reason.into()));
+                let text = commands::localize(lang, reason);
+                let _ = write_msg(&mut c.sender, &ServerMsg::Exit(text));
             }
         }
     }
@@ -828,7 +849,13 @@ impl State {
             }
         }
         self.buffer = Some(text);
-        self.message(cid, format!("copied {n} characters"));
+        let lang = self.client_lang(cid);
+        let copied = crate::i18n::trf(
+            lang,
+            "messages.copied",
+            &[("n", &n as &dyn std::fmt::Display)],
+        );
+        self.ok_message(cid, copied);
     }
 
     pub(crate) fn switch_session(&mut self, cid: usize, ni: usize) {
@@ -1059,9 +1086,10 @@ impl State {
                 // the target is bound now: `y` later runs `pending`, and kill-pane also
                 // refuses when the active pane has moved (`expect_pane`)
                 let target = self.confirm_target(si, &command)?;
+                let lang = self.client_lang(cid);
                 let text = match prompt {
                     Some(p) => p,
-                    None => self.confirm_prompt_text(si, &command)?,
+                    None => self.confirm_prompt_text(si, &command, lang)?,
                 };
                 if let Some(c) = self.clients.get_mut(&cid) {
                     let mut p = Prompt::confirm(text, target.pending);
@@ -1156,11 +1184,14 @@ impl State {
                 }
             }
             Cmd::Detach => {
+                let lang = self.client_lang(cid);
                 if let Some(mut c) = self.clients.remove(&cid) {
-                    let _ = write_msg(
-                        &mut c.sender,
-                        &ServerMsg::Exit(format!("detached (from session {})", c.session)),
+                    let text = crate::i18n::trf(
+                        lang,
+                        "messages.detached",
+                        &[("session", &c.session as &dyn std::fmt::Display)],
                     );
+                    let _ = write_msg(&mut c.sender, &ServerMsg::Exit(text));
                 }
             }
             Cmd::ChooseTree => {
@@ -1183,8 +1214,9 @@ impl State {
                 }
             }
             Cmd::SourceFile(p) => {
+                let lang = self.client_lang(cid);
                 let m = self.reload_config(p.as_deref())?;
-                self.message(cid, m);
+                self.ok_message(cid, commands::localize(lang, &m));
             }
             Cmd::SwitchClient { next } => {
                 let n = self.sessions.len();
@@ -1214,7 +1246,7 @@ impl State {
             }
             Cmd::DisplayMessage(m) => self.message(cid, m),
             Cmd::ListKeys => {
-                let lines = commands::key_lines(self);
+                let lines = commands::key_lines(self, self.client_lang(cid));
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.popup = Some((lines, 0));
                 }

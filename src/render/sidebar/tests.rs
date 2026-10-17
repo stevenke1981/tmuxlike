@@ -54,12 +54,13 @@ fn draw_with(
     width: u16,
     height: u16,
 ) -> Grid {
-    let rows = layout_rows(groups, any, hints, width, height);
+    let rows = layout_rows(groups, any, hints, width, height, Lang::En);
     let lane = Lane {
         t,
         tx: 0,
         tw: width,
         prefix: "C-b".into(),
+        lang: Lang::En,
     };
     let mut g = blank(width, height);
     for r in &rows {
@@ -135,7 +136,7 @@ fn focused_row_has_pointer_and_bold() {
             pv(2, Status::Blocked, "claude", Some("need approval"), true),
         ],
     )];
-    let rows = layout_rows(&groups, true, true, 25, 12);
+    let rows = layout_rows(&groups, true, true, 25, 12, Lang::En);
     let g = draw(&groups, true, true, 25, 12);
     let focused = rows
         .iter()
@@ -173,7 +174,7 @@ fn blocked_message_sits_on_indented_detail_line() {
             false,
         )],
     )];
-    let rows = layout_rows(&groups, true, true, 25, 12);
+    let rows = layout_rows(&groups, true, true, 25, 12, Lang::En);
     let pane_y = y_of(&rows, SidebarKind::Pane).unwrap();
     let g = draw(&groups, true, true, 25, 12);
     assert_eq!(y_of(&rows, SidebarKind::Detail), Some(pane_y + 1));
@@ -185,11 +186,14 @@ fn legend_fits_a_25_column_slot() {
     let t = Theme::terminal();
     let mut a = Theme::terminal();
     a.g = ASCII;
-    assert_eq!(legend_text(&t, false), "●work ▲block ◆done ○idle");
-    assert_eq!(legend_text(&t, true), "● work ▲ block ◆ done ○ idle");
-    assert!(legend_text(&t, false).width() <= 25);
-    assert!(legend_text(&a, false).width() <= 25);
-    assert!(legend_text(&t, true).width() <= 28);
+    assert_eq!(legend_text(&t, false, Lang::En), "●work ▲block ◆done ○idle");
+    assert_eq!(
+        legend_text(&t, true, Lang::En),
+        "● work ▲ block ◆ done ○ idle"
+    );
+    assert!(legend_text(&t, false, Lang::En).width() <= 25);
+    assert!(legend_text(&a, false, Lang::En).width() <= 25);
+    assert!(legend_text(&t, true, Lang::En).width() <= 28);
 }
 
 #[test]
@@ -197,7 +201,14 @@ fn overflow_ends_with_more_marker_and_keeps_footer() {
     let panes: Vec<PaneView> = (1..=40)
         .map(|i| pv(i, Status::Idle, &format!("a{i}"), None, false))
         .collect();
-    let rows = layout_rows(&[group(0, "demo", true, panes)], true, true, 25, 30);
+    let rows = layout_rows(
+        &[group(0, "demo", true, panes)],
+        true,
+        true,
+        25,
+        30,
+        Lang::En,
+    );
     let more = rows
         .iter()
         .find(|r| matches!(r.kind, SidebarKind::More(_)))
@@ -215,7 +226,7 @@ fn overflow_ends_with_more_marker_and_keeps_footer() {
 #[test]
 fn sixteen_sessions_at_height_ten_keep_attached_group_and_focus() {
     let groups = sixteen_groups();
-    let rows = layout_rows(&groups, true, true, 25, 10);
+    let rows = layout_rows(&groups, true, true, 25, 10, Lang::En);
     assert_eq!(more_count(&rows), Some(15), "all 15 closed groups hidden");
     assert!(y_of(&rows, SidebarKind::SessionOpen).is_some());
     assert!(closed_sessions(&rows).is_empty());
@@ -236,7 +247,7 @@ fn sixteen_sessions_at_height_ten_keep_attached_group_and_focus() {
 #[test]
 fn closed_groups_nearest_the_attached_one_are_kept_first() {
     let groups = sixteen_groups();
-    let rows = layout_rows(&groups, true, true, 25, 14);
+    let rows = layout_rows(&groups, true, true, 25, 14, Lang::En);
     assert_eq!(closed_sessions(&rows), vec![8, 10]);
     assert_eq!(more_count(&rows), Some(13));
     let open_y = y_of(&rows, SidebarKind::SessionOpen).unwrap();
@@ -254,7 +265,7 @@ fn closed_groups_nearest_the_attached_one_are_kept_first() {
 #[test]
 fn many_panes_in_open_group_keep_header_focus_and_marker_count() {
     let groups = many_panes(40, 25);
-    let rows = layout_rows(&groups, true, true, 25, 12);
+    let rows = layout_rows(&groups, true, true, 25, 12, Lang::En);
     assert_eq!(more_count(&rows), Some(36), "41 rows, 5 kept");
     let pane_ids: Vec<usize> = rows
         .iter()
@@ -279,7 +290,7 @@ fn many_panes_in_open_group_keep_header_focus_and_marker_count() {
 #[test]
 fn focus_on_the_last_pane_moves_the_window_to_the_end() {
     let groups = many_panes(40, 40);
-    let rows = layout_rows(&groups, true, true, 25, 12);
+    let rows = layout_rows(&groups, true, true, 25, 12, Lang::En);
     let pane_ids: Vec<usize> = rows
         .iter()
         .filter(|r| r.kind == SidebarKind::Pane)
@@ -296,7 +307,7 @@ fn blocked_detail_moves_with_its_pane_when_trimmed() {
         .collect();
     panes[2] = pv(3, Status::Blocked, "claude", Some("need approval"), true);
     let groups = vec![group(0, "demo", true, panes)];
-    let rows = layout_rows(&groups, true, true, 25, 9);
+    let rows = layout_rows(&groups, true, true, 25, 9, Lang::En);
     let pane_y = rows
         .iter()
         .find(|r| r.pane == Some(3) && r.kind == SidebarKind::Pane)
@@ -337,7 +348,7 @@ fn collapsed_session_shows_counts_and_hides_zeros() {
         vec![(Status::Blocked, 1), (Status::Working, 2)]
     );
     assert_eq!(counts(&groups[2].panes), vec![(Status::Idle, 2)]);
-    let rows = layout_rows(&groups, true, true, 25, 14);
+    let rows = layout_rows(&groups, true, true, 25, 14, Lang::En);
     let closed: Vec<u16> = rows
         .iter()
         .filter(|r| r.kind == SidebarKind::SessionClosed)
@@ -359,7 +370,7 @@ fn state_word_drops_when_name_budget_is_small() {
         true,
         vec![pv(2, Status::Blocked, "claude-long-name", None, false)],
     )];
-    let rows = layout_rows(&groups, true, false, 9, 6);
+    let rows = layout_rows(&groups, true, false, 9, 6, Lang::En);
     let g = draw(&groups, true, false, 9, 6);
     let y = y_of(&rows, SidebarKind::Pane).unwrap();
     let text = row_text(&g, y);
@@ -381,7 +392,7 @@ fn empty_state_shows_only_without_agents_and_with_hints() {
         vec![pv(1, Status::Idle, "sh", None, false)],
     )];
     assert_eq!(
-        empty_lines(25, "—"),
+        empty_lines(25, "—", Lang::En),
         vec![
             "no agent reports — see:",
             "tmuxlike pane",
@@ -393,17 +404,26 @@ fn empty_state_shows_only_without_agents_and_with_hints() {
             .filter(|r| matches!(r.kind, SidebarKind::Empty(_)))
             .count()
     };
-    assert_eq!(count(&layout_rows(&groups, false, true, 25, 20)), 3);
-    assert_eq!(count(&layout_rows(&groups, false, false, 25, 20)), 0);
-    assert_eq!(count(&layout_rows(&groups, true, true, 25, 20)), 0);
+    assert_eq!(
+        count(&layout_rows(&groups, false, true, 25, 20, Lang::En)),
+        3
+    );
+    assert_eq!(
+        count(&layout_rows(&groups, false, false, 25, 20, Lang::En)),
+        0
+    );
+    assert_eq!(
+        count(&layout_rows(&groups, true, true, 25, 20, Lang::En)),
+        0
+    );
 }
 
 #[test]
 fn empty_hint_wraps_to_the_same_height_in_both_glyph_sets() {
     for w in [9u16, 12, 16, 25, 40] {
         assert_eq!(
-            empty_lines(w, "—").len(),
-            empty_lines(w, ASCII.dash).len(),
+            empty_lines(w, "—", Lang::En).len(),
+            empty_lines(w, ASCII.dash, Lang::En).len(),
             "width {w}"
         );
     }
@@ -454,7 +474,7 @@ fn mono_muted_chrome_is_dim_and_colour_mode_is_not() {
             ],
         ),
     ];
-    let rows = layout_rows(&groups, true, true, 25, 12);
+    let rows = layout_rows(&groups, true, true, 25, 12, Lang::En);
     let row_y = |kind| y_of(&rows, kind).unwrap();
     let mut mono = Theme::terminal();
     mono.mono = true;
@@ -483,7 +503,7 @@ fn mono_empty_state_and_more_marker_are_dim() {
     let mut mono = Theme::terminal();
     mono.mono = true;
     let g = draw_with(&mono, &groups, true, true, 25, 10);
-    let more_y = layout_rows(&groups, true, true, 25, 10)
+    let more_y = layout_rows(&groups, true, true, 25, 10, Lang::En)
         .iter()
         .find(|r| matches!(r.kind, SidebarKind::More(_)))
         .unwrap()
@@ -497,11 +517,18 @@ fn mono_empty_state_and_more_marker_are_dim() {
         25,
         12,
     );
-    let hint_y = layout_rows(&[group(0, "demo", true, vec![])], false, true, 25, 12)
-        .iter()
-        .find(|r| matches!(r.kind, SidebarKind::Empty(0)))
-        .unwrap()
-        .y;
+    let hint_y = layout_rows(
+        &[group(0, "demo", true, vec![])],
+        false,
+        true,
+        25,
+        12,
+        Lang::En,
+    )
+    .iter()
+    .find(|r| matches!(r.kind, SidebarKind::Empty(0)))
+    .unwrap()
+    .y;
     assert!(cell(&empty, 0, hint_y).attrs & DIM != 0, "empty state");
 }
 
@@ -555,4 +582,89 @@ fn ascii_sidebar_rows_are_ascii() {
         (0..20).any(|y| row_text(&empty, y).contains("reports - see:")),
         "dash comes from the ASCII table"
     );
+}
+
+/// Draw like `draw_sidebar` but in `lang`, for the zh-TW checks below.
+fn draw_in(
+    t: &Theme,
+    groups: &[GroupView],
+    any: bool,
+    width: u16,
+    height: u16,
+    lang: Lang,
+) -> Grid {
+    let rows = layout_rows(groups, any, true, width, height, lang);
+    let lane = Lane {
+        t,
+        tx: 0,
+        tw: width,
+        prefix: "C-b".into(),
+        lang,
+    };
+    let mut g = blank(width, height);
+    for r in &rows {
+        draw_row(&mut g, &lane, r, groups);
+    }
+    g
+}
+
+#[test]
+fn zh_tw_legend_fits_the_default_sidebar_text_width() {
+    let t = Theme::terminal();
+    let text = legend_text(&t, false, Lang::ZhTw);
+    assert_eq!(text, "●執行 ▲待回應 ◆完成 ○閒置");
+    assert!(text.width() <= 25, "{text:?}");
+}
+
+#[test]
+fn zh_tw_title_hint_empty_state_and_state_words() {
+    let t = Theme::terminal();
+    let groups = vec![group(
+        0,
+        "demo",
+        true,
+        vec![pv(1, Status::Blocked, "claude", None, true)],
+    )];
+    let g = draw_in(&t, &groups, true, 25, 12, Lang::ZhTw);
+    let title = row_text(&g, 0);
+    assert!(title.starts_with("代理"), "{title:?}");
+    let pane_y = y_of(
+        &layout_rows(&groups, true, true, 25, 12, Lang::ZhTw),
+        SidebarKind::Pane,
+    )
+    .unwrap();
+    assert!(
+        row_text(&g, pane_y).ends_with("待回應"),
+        "{:?}",
+        row_text(&g, pane_y)
+    );
+    let hint = row_text(&g, 10);
+    assert_eq!(hint, "C-b a 隱藏  C-b s 切換", "{hint:?}");
+    assert!(legend_text(&t, false, Lang::ZhTw).contains("待回應"));
+
+    let empty = vec![group(0, "demo", true, vec![])];
+    let e = draw_in(&t, &empty, false, 25, 12, Lang::ZhTw);
+    let first = row_text(&e, 2);
+    assert!(first.starts_with("尚無代理回報"), "{first:?}");
+    let lines = empty_lines(25, "—", Lang::ZhTw);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines.iter().all(|l| l.width() <= 25), "{lines:?}");
+}
+
+#[test]
+fn zh_tw_overflow_marker_counts_hidden_rows() {
+    let t = Theme::terminal();
+    let panes: Vec<PaneView> = (0..40)
+        .map(|i| pv(i, Status::Working, &format!("p{i}"), None, i == 20))
+        .collect();
+    let groups = vec![group(0, "demo", true, panes)];
+    let rows = layout_rows(&groups, true, true, 25, 12, Lang::ZhTw);
+    let g = draw_in(&t, &groups, true, 25, 12, Lang::ZhTw);
+    let more_y = rows
+        .iter()
+        .find(|r| matches!(r.kind, SidebarKind::More(_)))
+        .unwrap()
+        .y;
+    let text = row_text(&g, more_y);
+    assert!(text.ends_with("更多") && text.contains('+'), "{text:?}");
 }
