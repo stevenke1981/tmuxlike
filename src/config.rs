@@ -28,6 +28,8 @@ pub struct Config {
     pub unbind: Vec<String>,
     /// Commands run after the config is loaded
     pub commands: Vec<String>,
+    /// Save the layout to a state file and restore it when the server restarts
+    pub persist: bool,
 }
 
 impl Default for Config {
@@ -45,6 +47,7 @@ impl Default for Config {
             bind: BTreeMap::new(),
             unbind: vec![],
             commands: vec![],
+            persist: true,
         }
     }
 }
@@ -143,6 +146,7 @@ impl Config {
             "busy-secs" => self.busy_secs = num(val)? as f32,
             "automatic-rename" => self.automatic_rename = parse_bool(val)?,
             "osc52" | "set-clipboard" => self.osc52 = parse_bool(val)?,
+            "persist" => self.persist = parse_bool(val)?,
             other => return Err(format!("unknown option: {other}")),
         }
         Ok(())

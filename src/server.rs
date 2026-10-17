@@ -27,6 +27,12 @@ pub struct Pane {
     pub last_output: Instant,
     pub attention: bool,
     pub copy: Option<CopyState>,
+    /// reported agent state (herdr-style `pane report-agent`)
+    pub agent: Option<crate::api::AgentInfo>,
+    /// user label (`pane rename`)
+    pub label: Option<String>,
+    /// working directory the pane was started in
+    pub cwd: Option<String>,
 }
 
 impl Pane {
@@ -133,7 +139,7 @@ pub struct State {
     notify: mpsc::Sender<()>,
 }
 
-type Shared = Arc<Mutex<State>>;
+pub type Shared = Arc<Mutex<State>>;
 
 impl State {
     fn id(&mut self) -> usize {
@@ -169,7 +175,7 @@ impl State {
         }
     }
 
-    fn sidx(&self, name: &str) -> Option<usize> {
+    pub(crate) fn sidx(&self, name: &str) -> Option<usize> {
         self.sessions.iter().position(|s| s.name == name)
     }
 
@@ -177,7 +183,7 @@ impl State {
         self.clients.get(&cid).and_then(|c| self.sidx(&c.session))
     }
 
-    fn active_pane(&self, si: usize) -> usize {
+    pub(crate) fn active_pane(&self, si: usize) -> usize {
         let s = &self.sessions[si];
         s.windows[s.active].active
     }
@@ -189,7 +195,7 @@ impl State {
         self.mark_dirty();
     }
 
-    fn spawn_pane(
+    pub(crate) fn spawn_pane(
         &mut self,
         shared: &Shared,
         rows: u16,
@@ -213,10 +219,14 @@ impl State {
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("TMUXLIKE", format!("{id}"));
-        if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+        cmd.env("TMUXLIKE_PANE_ID", crate::api::pane_id_str(id));
+        cmd.env("TMUXLIKE_SOCKET", ipc::base_name());
+        let start_dir = match cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            Some(d) => Some(d.to_string()),
+            None => dirs::home_dir().map(|h| h.to_string_lossy().into_owned()),
+        };
+        if let Some(d) = &start_dir {
             cmd.cwd(d);
-        } else if let Some(h) = dirs::home_dir() {
-            cmd.cwd(h);
         }
         crate::log!("pane {id}: spawning {shell:?} {}x{}", size.cols, size.rows);
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
@@ -241,6 +251,9 @@ impl State {
             last_output: Instant::now(),
             attention: false,
             copy: None,
+            agent: None,
+            label: None,
+            cwd: start_dir,
         };
         self.panes.insert(id, pane);
         let shared = shared.clone();
@@ -308,7 +321,7 @@ impl State {
             .unwrap_or(first)
     }
 
-    fn new_session(
+    pub(crate) fn new_session(
         &mut self,
         shared: &Shared,
         name: Option<String>,
@@ -347,7 +360,12 @@ impl State {
         Ok(name)
     }
 
-    fn new_window(&mut self, shared: &Shared, si: usize, name: Option<String>) -> Result<()> {
+    pub(crate) fn new_window(
+        &mut self,
+        shared: &Shared,
+        si: usize,
+        name: Option<String>,
+    ) -> Result<()> {
         let area = self.pane_area(&self.sessions[si]);
         let cwd = self.sessions[si].cwd.clone();
         let id = self.spawn_pane(shared, area.h, area.w, cwd.as_deref())?;
@@ -367,27 +385,71 @@ impl State {
     }
 
     fn split(&mut self, shared: &Shared, si: usize, dir: Dir) -> Result<()> {
-        let s = &self.sessions[si];
-        let w = &s.windows[s.active];
-        let cur = self
-            .panes
-            .get(&w.active)
-            .map(|p| p.rect)
-            .unwrap_or_default();
+        let pid = self.active_pane(si);
+        self.split_pane(shared, pid, dir, None, None, true)
+            .map(|_| ())
+    }
+
+    /// Split pane `pid` (the new pane goes right/below). `ratio` = share of the existing pane.
+    /// cwd defaults to the source pane's start dir. Returns the new pane id.
+    pub(crate) fn split_pane(
+        &mut self,
+        shared: &Shared,
+        pid: usize,
+        dir: Dir,
+        ratio: Option<f32>,
+        cwd: Option<String>,
+        focus: bool,
+    ) -> Result<usize> {
+        let (si, wi) = self.locate(pid).ok_or_else(|| anyhow!("pane not found"))?;
+        let cur = self.panes.get(&pid).map(|p| p.rect).unwrap_or_default();
         let (h, wd) = if dir == Dir::H {
             (cur.h, cur.w / 2)
         } else {
             (cur.h / 2, cur.w)
         };
-        let cwd = s.cwd.clone();
+        let cwd = cwd
+            .or_else(|| self.panes.get(&pid).and_then(|p| p.cwd.clone()))
+            .or_else(|| self.sessions[si].cwd.clone());
         let id = self.spawn_pane(shared, h, wd, cwd.as_deref())?;
-        let s = &mut self.sessions[si];
-        let w = &mut s.windows[s.active];
-        w.layout.split(w.active, id, dir);
-        w.active = id;
+        let w = &mut self.sessions[si].windows[wi];
+        w.layout
+            .split_with(pid, id, dir, ratio.unwrap_or(0.5).clamp(0.05, 0.95));
         w.zoomed = false;
+        if focus {
+            self.focus_pane(id);
+        }
         self.relayout(si);
-        Ok(())
+        Ok(id)
+    }
+
+    /// Make `pid` the focused pane of its window/session and mark it seen.
+    pub(crate) fn focus_pane(&mut self, pid: usize) -> bool {
+        let Some((si, wi)) = self.locate(pid) else {
+            return false;
+        };
+        let s = &mut self.sessions[si];
+        s.active = wi;
+        s.last_used = Instant::now();
+        let w = &mut s.windows[wi];
+        if w.active != pid {
+            w.zoomed = false;
+        }
+        w.active = pid;
+        if let Some(p) = self.panes.get_mut(&pid) {
+            p.attention = false;
+        }
+        self.relayout(si);
+        true
+    }
+
+    /// Close one pane (kills its process) and clean up its window/session.
+    pub(crate) fn kill_pane(&mut self, pid: usize) -> bool {
+        if !self.panes.contains_key(&pid) {
+            return false;
+        }
+        self.pane_exited(pid);
+        true
     }
 
     pub fn relayout(&mut self, si: usize) {
@@ -426,12 +488,12 @@ impl State {
         }
     }
 
-    fn mark_dirty(&mut self) {
+    pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
         let _ = self.notify.send(());
     }
 
-    fn locate(&self, pid: usize) -> Option<(usize, usize)> {
+    pub(crate) fn locate(&self, pid: usize) -> Option<(usize, usize)> {
         for (si, s) in self.sessions.iter().enumerate() {
             for (wi, w) in s.windows.iter().enumerate() {
                 if w.layout.contains(pid) {
@@ -499,7 +561,7 @@ impl State {
         }
     }
 
-    fn kill_session(&mut self, si: usize) {
+    pub(crate) fn kill_session(&mut self, si: usize) {
         let s = self.sessions.remove(si);
         for w in &s.windows {
             for pid in w.panes() {
@@ -511,7 +573,7 @@ impl State {
         self.drop_clients_of(&s.name, "session killed");
     }
 
-    fn write_pane(&mut self, pid: usize, bytes: &[u8]) {
+    pub(crate) fn write_pane(&mut self, pid: usize, bytes: &[u8]) {
         if let Some(p) = self.panes.get_mut(&pid) {
             if p.copy.is_some() {
                 p.copy = None;
@@ -523,7 +585,7 @@ impl State {
         }
     }
 
-    fn paste(&mut self, pid: usize, text: &str) {
+    pub(crate) fn paste(&mut self, pid: usize, text: &str) {
         let bp = self
             .panes
             .get(&pid)
@@ -614,7 +676,7 @@ impl State {
         }
     }
 
-    fn target_session(&self, target: Option<&str>) -> Result<usize, String> {
+    pub(crate) fn target_session(&self, target: Option<&str>) -> Result<usize, String> {
         match target {
             Some(t) => {
                 let name = t.split([':', '.']).next().unwrap_or(t);
@@ -751,6 +813,7 @@ impl State {
             }
             Cmd::KillSession => self.kill_session(si),
             Cmd::KillServer => {
+                crate::persist::clear();
                 while !self.sessions.is_empty() {
                     self.kill_session(0);
                 }
@@ -1360,12 +1423,18 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             }
         }
         Command::KillServer => {
+            crate::persist::clear();
             let mut st = shared.lock().unwrap();
             while !st.sessions.is_empty() {
                 st.kill_session(0);
             }
             let _ = write_msg(&mut w, &ServerMsg::Text(String::new()));
             std::process::exit(0);
+        }
+        Command::Api(req) => {
+            // handlers lock `shared` themselves so waits can release it between polls
+            let reply = crate::api::handle(&shared, req);
+            let _ = write_msg(&mut w, &ServerMsg::Api(reply));
         }
         Command::Run { line } => {
             let mut st = shared.lock().unwrap();
@@ -1489,12 +1558,19 @@ pub fn run() -> Result<()> {
             let _ = commands::parse(&c).and_then(|cmd| st.exec_global(cmd));
         }
     }
+    if shared.lock().unwrap().cfg.persist {
+        match crate::persist::restore_on_start(&shared) {
+            Ok(n) => crate::log!("restored {n} sessions"),
+            Err(e) => crate::log!("restore failed: {e}"),
+        }
+    }
 
     // Render / housekeeping thread.
     let sh = shared.clone();
     std::thread::spawn(move || {
         let mut ever_had_session = false;
         let mut last_tick = Instant::now();
+        let mut last_saved: Option<String> = None;
         loop {
             let _ = rx.recv_timeout(Duration::from_millis(500));
             std::thread::sleep(Duration::from_millis(8));
@@ -1536,6 +1612,9 @@ pub fn run() -> Result<()> {
                             }
                         }
                     }
+                }
+                if st.cfg.persist {
+                    crate::persist::autosave(&st, &mut last_saved);
                 }
                 for c in st.clients.values_mut() {
                     if c.message

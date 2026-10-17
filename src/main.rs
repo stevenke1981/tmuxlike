@@ -11,6 +11,7 @@ macro_rules! log {
     }};
 }
 
+mod api;
 mod client;
 mod commands;
 mod config;
@@ -18,6 +19,7 @@ mod copy;
 mod ipc;
 mod keys;
 mod layout;
+mod persist;
 mod proto;
 mod render;
 mod server;
@@ -38,6 +40,11 @@ USAGE:
   tmuxlike send-keys [-t S] KEYS  type text / keys (Enter, C-c, ...) into it
   tmuxlike source-file [PATH]    reload config in the running server
   tmuxlike <command> [args]      run any server command, e.g. `tmuxlike set mouse off`
+
+AUTOMATION (herdr-style, JSON output; see `tmuxlike pane --help`):
+  tmuxlike pane list|get|split|read|send-text|send-keys|run|wait-output|...
+  tmuxlike agent list|get|read|prompt|wait|rename|focus|send-keys
+  tmuxlike session list   tmuxlike api snapshot   tmuxlike server [stop]
 
 Config: $TMUXLIKE_CONFIG or <config_dir>/tmuxlike/config.toml";
 
@@ -68,6 +75,22 @@ fn main() {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     let res = match sub {
         "__server" => server::run(),
+        "server" if args.len() == 1 => server::run(),
+        g if api::cli::API_COMMANDS.contains(&g) => {
+            let current = std::env::var("TMUXLIKE_PANE_ID")
+                .ok()
+                .and_then(|v| api::parse_pane_id(&v));
+            match api::cli::parse(&args, current) {
+                Ok(req) => match client::api(req) {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => Err(e),
+                },
+                Err(usage) => {
+                    eprintln!("tmuxlike: {usage}");
+                    std::process::exit(2);
+                }
+            }
+        }
         "" => client::attach(None, false).or_else(|_| client::attach(None, true)),
         "new" | "new-session" if args.iter().any(|a| a == "-d") => {
             client::new_detached(flag(&args, "-s"))

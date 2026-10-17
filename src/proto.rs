@@ -23,6 +23,8 @@ pub enum Command {
     Run {
         line: String,
     },
+    /// herdr-style automation request (`tmuxlike pane ...`, `agent ...`)
+    Api(crate::api::Request),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -37,6 +39,7 @@ pub enum ServerMsg {
     Text(String),
     Exit(String),
     Error(String),
+    Api(crate::api::ApiResult),
 }
 
 pub fn write_msg<T: Serialize>(w: &mut dyn Write, msg: &T) -> io::Result<()> {

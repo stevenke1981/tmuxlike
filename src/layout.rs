@@ -1,6 +1,6 @@
 //! Binary split layout tree for panes.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Dir {
     /// side by side (left | right)
     H,
@@ -98,18 +98,25 @@ impl Node {
     }
 
     pub fn split(&mut self, target: usize, new: usize, dir: Dir) -> bool {
+        self.split_with(target, new, dir, 0.5)
+    }
+
+    /// Split `target`; `ratio` is the share of the first (existing) pane.
+    pub fn split_with(&mut self, target: usize, new: usize, dir: Dir, ratio: f32) -> bool {
         match self {
             Node::Leaf(i) if *i == target => {
                 *self = Node::Split {
                     dir,
-                    ratio: 0.5,
+                    ratio,
                     a: Box::new(Node::Leaf(target)),
                     b: Box::new(Node::Leaf(new)),
                 };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split { a, b, .. } => a.split(target, new, dir) || b.split(target, new, dir),
+            Node::Split { a, b, .. } => {
+                a.split_with(target, new, dir, ratio) || b.split_with(target, new, dir, ratio)
+            }
         }
     }
 
