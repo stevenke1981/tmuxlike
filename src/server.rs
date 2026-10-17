@@ -1,5 +1,5 @@
 //! The multiplexer server: owns sessions, windows, panes (ptys) and renders frames for clients.
-use crate::commands::{self, Cmd, key_name};
+use crate::commands::{self, Cmd};
 use crate::config::{Config, config_path};
 use crate::copy::{self, CopyState};
 use crate::ipc;
@@ -8,9 +8,7 @@ use crate::layout::{Dir, Move, Node, Rect, neighbor};
 use crate::proto::{ClientMsg, Command, ServerMsg, read_msg, write_msg};
 use crate::render::{Frame, chooser_entries, render_client};
 use anyhow::{Result, anyhow};
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use interprocess::local_socket::prelude::*;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{BTreeMap, HashMap};
@@ -220,7 +218,7 @@ impl State {
         self.sessions.iter().position(|s| s.name == name)
     }
 
-    fn client_si(&self, cid: usize) -> Option<usize> {
+    pub(crate) fn client_si(&self, cid: usize) -> Option<usize> {
         self.clients.get(&cid).and_then(|c| self.sidx(&c.session))
     }
 
@@ -229,7 +227,7 @@ impl State {
         s.windows[s.active].active
     }
 
-    fn message(&mut self, cid: usize, msg: impl Into<String>) {
+    pub(crate) fn message(&mut self, cid: usize, msg: impl Into<String>) {
         if let Some(c) = self.clients.get_mut(&cid) {
             c.message = Some((msg.into(), Instant::now()));
         }
@@ -646,7 +644,7 @@ impl State {
         self.write_pane(pid, data.as_bytes());
     }
 
-    fn set_clipboard(&mut self, cid: usize, text: String) {
+    pub(crate) fn set_clipboard(&mut self, cid: usize, text: String) {
         let n = text.chars().count();
         if self.cfg.osc52 {
             let seq = copy::osc52(&text);
@@ -658,7 +656,7 @@ impl State {
         self.message(cid, format!("copied {n} characters"));
     }
 
-    fn switch_session(&mut self, cid: usize, ni: usize) {
+    pub(crate) fn switch_session(&mut self, cid: usize, ni: usize) {
         let Some(si) = self.client_si(cid) else {
             return;
         };
@@ -1024,413 +1022,6 @@ impl State {
         }
         self.mark_dirty();
         Ok(())
-    }
-
-    fn run_line(&mut self, shared: &Shared, cid: usize, line: &str) {
-        if let Err(e) = commands::parse(line).and_then(|c| self.exec(shared, cid, c)) {
-            self.message(cid, e);
-        }
-    }
-
-    fn handle_event(&mut self, shared: &Shared, cid: usize, ev: Event) {
-        let Some(si) = self.client_si(cid) else {
-            return;
-        };
-        self.sessions[si].last_used = Instant::now();
-        match ev {
-            Event::Resize(cols, rows) => {
-                let s = &mut self.sessions[si];
-                s.cols = cols.max(10);
-                s.rows = rows.max(3);
-                self.relayout(si);
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.frame.invalidate();
-                }
-            }
-            Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(shared, cid, si, k),
-            Event::Paste(text) => {
-                if let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    p.buf.push_str(&text.replace(['\r', '\n'], " "));
-                    self.mark_dirty();
-                    return;
-                }
-                let pid = self.active_pane(si);
-                self.paste(pid, &text);
-            }
-            Event::Mouse(m) if self.cfg.mouse => self.handle_mouse(cid, si, m),
-            _ => {}
-        }
-    }
-
-    fn handle_mouse(&mut self, cid: usize, si: usize, m: crossterm::event::MouseEvent) {
-        let s = &self.sessions[si];
-        let w = &s.windows[s.active];
-        let rects = self.visible_rects(s, w);
-        let hit = rects
-            .iter()
-            .find(|(_, r)| r.contains(m.column, m.row))
-            .copied();
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.drag = None;
-                    if c.chooser.is_some() || c.popup.is_some() {
-                        c.chooser = None;
-                        c.popup = None;
-                        self.mark_dirty();
-                        return;
-                    }
-                }
-                if let Some((pid, r)) = hit {
-                    let s = &mut self.sessions[si];
-                    s.windows[s.active].active = pid;
-                    if let Some(p) = self.panes.get_mut(&pid) {
-                        if let Some(cs) = &mut p.copy {
-                            cs.anchor = None;
-                        }
-                        let off = p.parser.screen().scrollback();
-                        let row = copy::abs_row(m.row - r.y, off);
-                        if let Some(c) = self.clients.get_mut(&cid) {
-                            c.drag = Some((pid, row, m.column - r.x, false));
-                        }
-                    }
-                    self.mark_dirty();
-                } else if m.row == s.rows - 1 {
-                    if let Some(wi) = crate::render::status_hit(s, m.column) {
-                        self.sessions[si].active = wi;
-                        self.relayout(si);
-                    }
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                let Some((pid, row, col, _)) = self.clients.get(&cid).and_then(|c| c.drag) else {
-                    return;
-                };
-                let Some(r) = rects.iter().find(|(i, _)| *i == pid).map(|x| x.1) else {
-                    return;
-                };
-                let Some(p) = self.panes.get_mut(&pid) else {
-                    return;
-                };
-                let mut cy = m.row.clamp(r.y, r.y + r.h - 1) - r.y;
-                let cx = m.column.clamp(r.x, r.x + r.w - 1) - r.x;
-                // auto-scroll when dragging past the edges
-                let off = p.parser.screen().scrollback();
-                if m.row < r.y {
-                    p.parser.screen_mut().set_scrollback(off + 1);
-                    cy = 0;
-                } else if m.row >= r.y + r.h && off > 0 {
-                    p.parser.screen_mut().set_scrollback(off - 1);
-                }
-                let cs = p.copy.get_or_insert_with(CopyState::default);
-                cs.anchor = Some((row, col));
-                cs.line = false;
-                cs.cx = cx;
-                cs.cy = cy;
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.drag = Some((pid, row, col, true));
-                }
-                self.mark_dirty();
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let Some((pid, _, _, moved)) =
-                    self.clients.get_mut(&cid).and_then(|c| c.drag.take())
-                else {
-                    return;
-                };
-                if moved {
-                    self.copy_selection(cid, pid);
-                }
-            }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let up = m.kind == MouseEventKind::ScrollUp;
-                if let Some((pid, r)) = hit {
-                    let p = self.panes.get_mut(&pid).unwrap();
-                    if p.parser.screen().alternate_screen() {
-                        let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-                        for _ in 0..3 {
-                            let _ = p.writer.write_all(seq);
-                        }
-                        let _ = p.writer.flush();
-                    } else {
-                        let cur = p.parser.screen().scrollback();
-                        let new = if up { cur + 3 } else { cur.saturating_sub(3) };
-                        p.parser.screen_mut().set_scrollback(new);
-                        if p.parser.screen().scrollback() > 0 {
-                            p.copy.get_or_insert(CopyState {
-                                cx: 0,
-                                cy: r.h - 1,
-                                anchor: None,
-                                line: false,
-                            });
-                        } else if p.copy.as_ref().is_some_and(|c| c.anchor.is_none()) {
-                            p.copy = None;
-                        }
-                        self.mark_dirty();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn copy_selection(&mut self, cid: usize, pid: usize) {
-        let Some(p) = self.panes.get_mut(&pid) else {
-            return;
-        };
-        let Some(cs) = p.copy.clone() else { return };
-        let Some(anchor) = cs.anchor else { return };
-        let off = p.parser.screen().scrollback();
-        let cur = (copy::abs_row(cs.cy, off), cs.cx);
-        let text = copy::extract(&mut p.parser, anchor, cur, cs.line);
-        p.copy = None;
-        p.parser.screen_mut().set_scrollback(0);
-        self.set_clipboard(cid, text);
-    }
-
-    fn handle_key(&mut self, shared: &Shared, cid: usize, si: usize, k: KeyEvent) {
-        let Some(c) = self.clients.get_mut(&cid) else {
-            return;
-        };
-        // overlays first
-        if let Some((lines, off)) = &mut c.popup {
-            let max = lines.len().saturating_sub(1);
-            match k.code {
-                KeyCode::Down | KeyCode::Char('j') => *off = (*off + 1).min(max),
-                KeyCode::Up | KeyCode::Char('k') => *off = off.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => *off = (*off + 10).min(max),
-                KeyCode::PageUp => *off = off.saturating_sub(10),
-                _ => c.popup = None,
-            }
-            self.mark_dirty();
-            return;
-        }
-        if let Some(sel) = c.chooser {
-            let entries = chooser_entries(self);
-            let c = self.clients.get_mut(&cid).unwrap();
-            match k.code {
-                KeyCode::Up | KeyCode::Char('k') => c.chooser = Some(sel.saturating_sub(1)),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    c.chooser = Some((sel + 1).min(entries.len().saturating_sub(1)))
-                }
-                KeyCode::Enter => {
-                    c.chooser = None;
-                    if let Some(&(nsi, wi)) = entries.get(sel) {
-                        self.switch_session(cid, nsi);
-                        if let Some(wi) = wi {
-                            self.sessions[nsi].active = wi;
-                            self.relayout(nsi);
-                        }
-                    }
-                }
-                KeyCode::Char('x') => {
-                    c.chooser = None;
-                    if let Some(&(nsi, wi)) = entries.get(sel) {
-                        match wi {
-                            Some(wi) => {
-                                for pid in self.sessions[nsi].windows[wi].panes() {
-                                    self.pane_exited(pid);
-                                }
-                            }
-                            None => self.kill_session(nsi),
-                        }
-                    }
-                }
-                _ => c.chooser = None,
-            }
-            self.mark_dirty();
-            return;
-        }
-        if let Some(p) = &mut c.prompt {
-            match k.code {
-                KeyCode::Enter => {
-                    let p = c.prompt.take().unwrap();
-                    let line = match p.kind {
-                        PromptKind::Command => p.buf,
-                        PromptKind::RenameWindow => {
-                            format!("rename-window \"{}\"", p.buf.replace('"', "\\\""))
-                        }
-                        PromptKind::RenameSession => {
-                            format!("rename-session \"{}\"", p.buf.replace('"', "\\\""))
-                        }
-                    };
-                    if !line.trim().is_empty() {
-                        self.run_line(shared, cid, &line);
-                    }
-                }
-                KeyCode::Esc => c.prompt = None,
-                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    c.prompt = None
-                }
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.clear(),
-                KeyCode::Backspace => {
-                    p.buf.pop();
-                }
-                KeyCode::Char(ch) if !k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.push(ch),
-                _ => {}
-            }
-            self.mark_dirty();
-            return;
-        }
-        if c.prefix {
-            c.prefix = false;
-            self.mark_dirty();
-            if self.cfg.is_prefix(&k) {
-                let _ = self.exec(shared, cid, Cmd::SendPrefix);
-                return;
-            }
-            let Some(name) = key_name(&k) else { return };
-            match self.bindings.get(&name).cloned() {
-                Some(line) => self.run_line(shared, cid, &line),
-                None => {}
-            }
-            return;
-        }
-        if self.cfg.is_prefix(&k) {
-            c.prefix = true;
-            self.mark_dirty();
-            return;
-        }
-        let pid = self.active_pane(si);
-        if self.panes.get(&pid).is_some_and(|p| p.copy.is_some()) {
-            self.copy_key(cid, pid, k);
-            return;
-        }
-        let Some(p) = self.panes.get_mut(&pid) else {
-            return;
-        };
-        let app = p.parser.screen().application_cursor();
-        let b = keys::encode(&k, app);
-        self.write_pane(pid, &b);
-    }
-
-    #[allow(unused_assignments)]
-    fn copy_key(&mut self, cid: usize, pid: usize, k: KeyEvent) {
-        let Some(p) = self.panes.get_mut(&pid) else {
-            return;
-        };
-        let (h, w) = (p.rect.h, p.rect.w);
-        let mut off = p.parser.screen().scrollback();
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let mut cs = p.copy.clone().unwrap();
-        let scroll_to = |n: usize, parser: &mut vt100::Parser| -> usize {
-            parser.screen_mut().set_scrollback(n);
-            parser.screen().scrollback()
-        };
-        let row_text = |parser: &vt100::Parser, y: u16| -> String {
-            (0..w)
-                .map(|x| {
-                    parser
-                        .screen()
-                        .cell(y, x)
-                        .map(|c| c.contents().to_string())
-                        .unwrap_or_default()
-                })
-                .map(|s| if s.is_empty() { " ".into() } else { s })
-                .collect()
-        };
-        let mut done = false;
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc
-                if cs.anchor.is_none() || k.code == KeyCode::Char('q') =>
-            {
-                done = true
-            }
-            KeyCode::Esc => cs.anchor = None,
-            KeyCode::Char('c') if ctrl => done = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                if cs.cy > 0 {
-                    cs.cy -= 1
-                } else {
-                    off = scroll_to(off + 1, &mut p.parser)
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if cs.cy + 1 < h {
-                    cs.cy += 1
-                } else if off > 0 {
-                    off = scroll_to(off - 1, &mut p.parser)
-                }
-            }
-            KeyCode::Left | KeyCode::Char('h') => cs.cx = cs.cx.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => cs.cx = (cs.cx + 1).min(w - 1),
-            KeyCode::Char('0') | KeyCode::Home => cs.cx = 0,
-            KeyCode::Char('$') | KeyCode::End => {
-                cs.cx =
-                    (row_text(&p.parser, cs.cy).trim_end().chars().count() as u16).saturating_sub(1)
-            }
-            KeyCode::Char('w') => {
-                let t: Vec<char> = row_text(&p.parser, cs.cy).chars().collect();
-                let mut x = cs.cx as usize;
-                while x < t.len() && !t[x].is_whitespace() {
-                    x += 1;
-                }
-                while x < t.len() && t[x].is_whitespace() {
-                    x += 1;
-                }
-                cs.cx = (x.min(t.len().saturating_sub(1))) as u16;
-            }
-            KeyCode::Char('b') if !ctrl => {
-                let t: Vec<char> = row_text(&p.parser, cs.cy).chars().collect();
-                let mut x = cs.cx as usize;
-                while x > 0 && t.get(x - 1).is_some_and(|c| c.is_whitespace()) {
-                    x -= 1;
-                }
-                while x > 0 && t.get(x - 1).is_some_and(|c| !c.is_whitespace()) {
-                    x -= 1;
-                }
-                cs.cx = x as u16;
-            }
-            KeyCode::PageUp | KeyCode::Char('b') => {
-                off = scroll_to(off + h as usize, &mut p.parser)
-            }
-            KeyCode::PageDown | KeyCode::Char('f') => {
-                off = scroll_to(off.saturating_sub(h as usize), &mut p.parser)
-            }
-            KeyCode::Char('u') => off = scroll_to(off + h as usize / 2, &mut p.parser),
-            KeyCode::Char('d') => {
-                off = scroll_to(off.saturating_sub(h as usize / 2), &mut p.parser)
-            }
-            KeyCode::Char('g') => {
-                off = scroll_to(usize::MAX, &mut p.parser);
-                cs.cy = 0;
-            }
-            KeyCode::Char('G') => {
-                off = scroll_to(0, &mut p.parser);
-                cs.cy = h - 1;
-            }
-            KeyCode::Char('H') => cs.cy = 0,
-            KeyCode::Char('L') => cs.cy = h - 1,
-            KeyCode::Char('v') | KeyCode::Char(' ') => {
-                cs.line = false;
-                cs.anchor = if cs.anchor.is_some() && !cs.line {
-                    None
-                } else {
-                    Some((copy::abs_row(cs.cy, off), cs.cx))
-                };
-            }
-            KeyCode::Char('V') => {
-                cs.line = true;
-                cs.anchor = Some((copy::abs_row(cs.cy, off), cs.cx));
-            }
-            KeyCode::Char('y') | KeyCode::Enter => {
-                if cs.anchor.is_some() {
-                    p.copy = Some(cs);
-                    self.copy_selection(cid, pid);
-                    self.mark_dirty();
-                    return;
-                }
-                done = true;
-            }
-            _ => {}
-        }
-        if done {
-            p.copy = None;
-            p.parser.screen_mut().set_scrollback(0);
-        } else {
-            p.copy = Some(cs);
-        }
-        self.mark_dirty();
     }
 }
 

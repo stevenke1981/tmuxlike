@@ -417,7 +417,7 @@ def step_help():
 
 
 def step_wait_output_wrapped(p1):
-    narrow = expect_json(["pane", "split", p1, "--direction", "right", "--ratio", "0.2", "--no-focus"],
+    narrow = expect_json(["pane", "split", p1, "--direction", "right", "--ratio", "0.4", "--no-focus"],
                          "split narrow pane")["pane"]
     pid = check_pane_id(narrow.get("pane_id"), "split narrow pane")
     # A 30-column pane can break the prompt across rows, so join the visible rows before matching.
