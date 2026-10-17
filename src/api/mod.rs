@@ -307,10 +307,11 @@ pub fn pane_json(st: &State, pid: usize) -> Option<Value> {
 pub fn handle(shared: &Shared, req: Request) -> ApiResult {
     match req {
         Request::ServerStop => {
-            // keep persisted state so the next server start restores the layout
-            let st = shared.lock().unwrap();
+            // keep persisted state so the next server start restores the layout;
+            // the connection handler exits the process after sending this reply
+            let st = shared.lock().unwrap_or_else(|e| e.into_inner());
             crate::persist::save_now(&st);
-            std::process::exit(0);
+            Ok(Reply::Json(json!({ "stopped": true })))
         }
         Request::PaneReportAgent { .. }
         | Request::PaneReleaseAgent { .. }

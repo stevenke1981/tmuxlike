@@ -1423,8 +1423,9 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             }
         }
         Command::KillServer => {
-            crate::persist::clear();
             let mut st = shared.lock().unwrap();
+            // under the lock so the render tick cannot autosave it back before exit
+            crate::persist::clear();
             while !st.sessions.is_empty() {
                 st.kill_session(0);
             }
@@ -1432,9 +1433,18 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
             std::process::exit(0);
         }
         Command::Api(req) => {
+            let stop = matches!(req, crate::api::Request::ServerStop);
             // handlers lock `shared` themselves so waits can release it between polls
             let reply = crate::api::handle(&shared, req);
             let _ = write_msg(&mut w, &ServerMsg::Api(reply));
+            if stop {
+                // the state file was saved by the handler; pane processes do not survive
+                let mut st = shared.lock().unwrap();
+                while !st.sessions.is_empty() {
+                    st.kill_session(0);
+                }
+                std::process::exit(0);
+            }
         }
         Command::Run { line } => {
             let mut st = shared.lock().unwrap();

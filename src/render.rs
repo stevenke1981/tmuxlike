@@ -1,4 +1,5 @@
 //! Compose a session's visible state into a cell grid and diff it into ANSI output.
+use crate::api::Status;
 use crate::server::{Client, PromptKind, Session, State};
 use crossterm::style::{Attribute, Color, Print, SetAttribute};
 use crossterm::{cursor, terminal};
@@ -361,17 +362,23 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                     let Some(p) = st.panes.get(&pid) else {
                         continue;
                     };
-                    let (glyph, color, label) = if p.busy(&st.cfg) {
-                        ("●", Color::Yellow, "working")
-                    } else if p.attention {
-                        ("◆", Color::Blue, "done")
-                    } else {
-                        ("○", Color::DarkGrey, "idle")
+                    let (glyph, color, label) = match crate::api::agent::status(p, &st.cfg) {
+                        Status::Working => ("●", Color::Yellow, "working"),
+                        Status::Blocked => ("▲", Color::Red, "blocked"),
+                        Status::Done => ("◆", Color::Blue, "done"),
+                        Status::Unknown => ("?", Color::DarkGrey, "unknown"),
+                        Status::Idle => ("○", Color::DarkGrey, "idle"),
                     };
+                    let who = p
+                        .agent
+                        .as_ref()
+                        .and_then(|a| a.name.as_deref().or(Some(a.agent.as_str())))
+                        .or(p.label.as_deref())
+                        .unwrap_or(wnd.name.as_str());
                     let focused = cur && wi == sess.active && pid == wnd.active;
                     let x2 = tx + 1;
                     g.text(x2, y, 2, glyph, color, Color::Reset, 0);
-                    let txt = format!("{}.{} {} {}", wi, pi, wnd.name, label);
+                    let txt = format!("{}.{} {} {}", wi, pi, who, label);
                     g.text(
                         x2 + 2,
                         y,
@@ -391,7 +398,7 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                 tx,
                 h - 2,
                 tw,
-                "● work ◆ done ○ idle",
+                "● work ▲ block ◆ done ○ idle",
                 Color::DarkGrey,
                 Color::Reset,
                 0,
@@ -586,18 +593,24 @@ pub fn render_client(st: &State, c: &mut Client) -> Option<String> {
                     ),
                     Some(wi) => {
                         let wn = &ss.windows[wi];
-                        let busy = wn
-                            .panes()
-                            .iter()
-                            .any(|p| st.panes.get(p).is_some_and(|p| p.busy(&st.cfg)));
+                        let (working, blocked) =
+                            wn.panes().iter().filter_map(|p| st.panes.get(p)).fold(
+                                (false, false),
+                                |(w, b), p| match crate::api::agent::status(p, &st.cfg) {
+                                    Status::Working => (true, b),
+                                    Status::Blocked => (w, true),
+                                    _ => (w, b),
+                                },
+                            );
                         (
                             format!(
-                                "  ├─ {}: {} [{} panes]{}{}",
+                                "  ├─ {}: {} [{} panes]{}{}{}",
                                 wi,
                                 wn.name,
                                 wn.panes().len(),
                                 if wi == ss.active { " *" } else { "" },
-                                if busy { " ●" } else { "" }
+                                if working { " ●" } else { "" },
+                                if blocked { " ▲" } else { "" }
                             ),
                             false,
                         )

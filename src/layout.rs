@@ -97,10 +97,6 @@ impl Node {
         }
     }
 
-    pub fn split(&mut self, target: usize, new: usize, dir: Dir) -> bool {
-        self.split_with(target, new, dir, 0.5)
-    }
-
     /// Split `target`; `ratio` is the share of the first (existing) pane.
     pub fn split_with(&mut self, target: usize, new: usize, dir: Dir, ratio: f32) -> bool {
         match self {
@@ -211,7 +207,7 @@ mod tests {
     #[test]
     fn split_and_layout() {
         let mut n = Node::Leaf(1);
-        assert!(n.split(1, 2, Dir::H));
+        assert!(n.split_with(1, 2, Dir::H, 0.5));
         let mut out = vec![];
         n.layout(R, &mut out);
         assert_eq!(
@@ -238,7 +234,7 @@ mod tests {
                 }
             )
         );
-        assert!(n.split(2, 3, Dir::V));
+        assert!(n.split_with(2, 3, Dir::V, 0.5));
         let mut out = vec![];
         n.layout(R, &mut out);
         assert_eq!(out.len(), 3);
@@ -252,8 +248,8 @@ mod tests {
     #[test]
     fn remove_and_resize() {
         let mut n = Node::Leaf(1);
-        n.split(1, 2, Dir::H);
-        n.split(2, 3, Dir::V);
+        n.split_with(1, 2, Dir::H, 0.5);
+        n.split_with(2, 3, Dir::V, 0.5);
         assert!(n.resize(1, Dir::H, 0.1));
         let mut out = vec![];
         n.layout(R, &mut out);
