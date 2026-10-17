@@ -6,6 +6,7 @@
 //! (see [`pack_chooser`]), so the server needs no new field.
 use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, cut};
 use crate::api::Status;
+use crate::i18n::{Lang, tr, trf};
 use crate::server::{Pane, State};
 use crate::theme::{ASCII, Glyphs, Theme};
 use crossterm::style::Color;
@@ -227,13 +228,13 @@ struct Row {
     bold: bool,
 }
 
-fn chooser_rows(tree: &[NodeSession], filter: Filter, g: &Glyphs) -> Vec<Row> {
+fn chooser_rows(tree: &[NodeSession], filter: Filter, g: &Glyphs, lang: Lang) -> Vec<Row> {
     let entries = filter_entries(tree, filter);
     (0..entries.len())
         .map(|i| {
-            let (prefix, text, bold) = row_art(tree, &entries, i, g);
+            let (prefix, text, bold) = row_art(tree, &entries, i, g, lang);
             let status = status_of(tree, entries[i]);
-            let word = entries[i].2.map(|_| status_word(status));
+            let word = entries[i].2.map(|_| status_word(lang, status));
             Row {
                 status,
                 prefix,
@@ -252,13 +253,14 @@ fn row_art(
     entries: &[Entry],
     i: usize,
     g: &Glyphs,
+    lang: Lang,
 ) -> (String, String, bool) {
     let (si, wi, pi) = entries[i];
     let s = &tree[si];
     match (wi, pi) {
         (None, _) => (
             String::new(),
-            session_text(&s.name, s.windows.len(), s.attached),
+            session_text(lang, &s.name, s.windows.len(), s.attached),
             true,
         ),
         (Some(w), None) => {
@@ -270,7 +272,7 @@ fn row_art(
             };
             (
                 format!("{branch} "),
-                window_text(w, &win.name, win.active, win.panes.len()),
+                window_text(lang, w, &win.name, win.active, win.panes.len()),
                 false,
             )
         }
@@ -327,24 +329,52 @@ fn pane_follows(entries: &[Entry], i: usize) -> bool {
     false
 }
 
-/// `1 window` / `2 windows`.
-fn count_noun(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
+/// Noun counted in a row label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Noun {
+    Window,
+    Pane,
 }
 
-fn session_text(name: &str, windows: usize, attached: bool) -> String {
-    format!(
-        "{name}: {}{}",
-        count_noun(windows, "window", "windows"),
-        if attached { " (attached)" } else { "" }
+/// `1 window` / `2 windows`, `1 個視窗` (zh-TW has no plural; the English count picks the key).
+fn count_text(lang: Lang, n: usize, noun: Noun) -> String {
+    let key = match (noun, n == 1) {
+        (Noun::Window, true) => "render.count.window",
+        (Noun::Window, false) => "render.count.windows",
+        (Noun::Pane, true) => "render.count.pane",
+        (Noun::Pane, false) => "render.count.panes",
+    };
+    trf(lang, key, &[("n", &n)])
+}
+
+/// `work: 2 windows (attached)`. The name is the last argument so it is never re-substituted.
+fn session_text(lang: Lang, name: &str, windows: usize, attached: bool) -> String {
+    let count = count_text(lang, windows, Noun::Window);
+    let attached = if attached {
+        tr(lang, "render.chooser.attached")
+    } else {
+        ""
+    };
+    trf(
+        lang,
+        "render.session.text",
+        &[("count", &count), ("attached", &attached), ("name", &name)],
     )
 }
 
-fn window_text(index: usize, name: &str, active: bool, panes: usize) -> String {
-    format!(
-        "{index}: {name}{}  {}",
-        if active { "*" } else { "" },
-        count_noun(panes, "pane", "panes")
+/// `0: cmd*  2 panes`. The name is the last argument so it is never re-substituted.
+fn window_text(lang: Lang, index: usize, name: &str, active: bool, panes: usize) -> String {
+    let count = count_text(lang, panes, Noun::Pane);
+    let star = if active { "*" } else { "" };
+    trf(
+        lang,
+        "render.window.text",
+        &[
+            ("index", &index),
+            ("star", &star),
+            ("count", &count),
+            ("name", &name),
+        ],
     )
 }
 
@@ -353,14 +383,16 @@ fn pane_text(window: usize, pane: usize, who: &str) -> String {
     format!("{window}.{pane} {who}")
 }
 
-fn status_word(s: Status) -> &'static str {
-    match s {
-        Status::Working => "working",
-        Status::Blocked => "blocked",
-        Status::Done => "done",
-        Status::Idle => "idle",
-        Status::Unknown => "unknown",
-    }
+/// State word for a status (`working`, `執行中`); shared with the sidebar and pane titles.
+pub(super) fn status_word(lang: Lang, s: Status) -> &'static str {
+    let key = match s {
+        Status::Working => "render.state.working",
+        Status::Blocked => "render.state.blocked",
+        Status::Done => "render.state.done",
+        Status::Idle => "render.state.idle",
+        Status::Unknown => "render.state.unknown",
+    };
+    tr(lang, key)
 }
 
 /// What `x` on a chooser row kills, and the y/n question that names it.
@@ -371,26 +403,33 @@ pub struct KillTarget {
     pub command: String,
 }
 
-/// Kill target for a session or window row. Pane rows have none (pane kill is `C-b x`).
+/// Kill target for a session or window row, in the server's default language. Pane rows have
+/// none (pane kill is `C-b x`). Clients in another language use [`kill_target_lang`].
 pub fn kill_target(st: &State, e: Entry) -> Option<KillTarget> {
-    kill_target_in(&snapshot(st, ""), e)
+    kill_target_lang(st, e, Lang::resolve(&st.cfg.lang, None))
+}
+
+/// [`kill_target`] with the question written in `lang`.
+pub fn kill_target_lang(st: &State, e: Entry, lang: Lang) -> Option<KillTarget> {
+    kill_target_in(&snapshot(st, ""), e, lang)
 }
 
 fn blocked_count<'a>(panes: impl Iterator<Item = &'a NodePane>) -> usize {
     panes.filter(|p| p.status == Status::Blocked).count()
 }
 
-fn kill_target_in(tree: &[NodeSession], e: Entry) -> Option<KillTarget> {
+fn kill_target_in(tree: &[NodeSession], e: Entry, lang: Lang) -> Option<KillTarget> {
     let s = tree.get(e.0)?;
     match (e.1, e.2) {
         (_, Some(_)) => None,
         (None, _) => {
             let n = blocked_count(s.windows.iter().flat_map(|w| w.panes.iter()));
+            let windows = count_text(lang, s.windows.len(), Noun::Window);
             Some(KillTarget {
-                question: format!(
-                    "kill session {} ({}, {n} blocked)?",
-                    s.name,
-                    count_noun(s.windows.len(), "window", "windows")
+                question: trf(
+                    lang,
+                    "render.kill.session",
+                    &[("windows", &windows), ("blocked", &n), ("name", &s.name)],
                 ),
                 command: format!("kill-session -t {}", arg_quote(&s.name)),
             })
@@ -398,11 +437,17 @@ fn kill_target_in(tree: &[NodeSession], e: Entry) -> Option<KillTarget> {
         (Some(w), None) => {
             let win = s.windows.get(w)?;
             let n = blocked_count(win.panes.iter());
+            let panes = count_text(lang, win.panes.len(), Noun::Pane);
             Some(KillTarget {
-                question: format!(
-                    "kill window {w} {} ({}, {n} blocked)?",
-                    win.name,
-                    count_noun(win.panes.len(), "pane", "panes")
+                question: trf(
+                    lang,
+                    "render.kill.window",
+                    &[
+                        ("index", &w),
+                        ("panes", &panes),
+                        ("blocked", &n),
+                        ("name", &win.name),
+                    ],
                 ),
                 command: format!("kill-window -t {}", arg_quote(&format!("{}:{w}", s.name))),
             })
@@ -483,29 +528,34 @@ struct BoxSpec<'a> {
     scroll: usize,
 }
 
-const POPUP_HINT: &str = "j/k scroll  esc close";
-const POPUP_TITLE: &str = "keys";
-
 /// Chooser footer; the ASCII set spells out the arrows and Enter.
-fn chooser_hints(g: &Glyphs) -> &'static str {
+fn chooser_hints(g: &Glyphs, lang: Lang) -> &'static str {
     if *g == ASCII {
-        "up/dn move  enter open  x kill  b/w/d/i filter  esc close"
+        tr(lang, "render.chooser.hints_ascii")
     } else {
-        "↑↓ move  ⏎ open  x kill  b/w/d/i filter  esc close"
+        tr(lang, "render.chooser.hints")
     }
 }
 
-fn chooser_title(filter: Filter) -> String {
+fn chooser_title(lang: Lang, filter: Filter) -> String {
     match filter {
-        Filter::All => "Sessions".to_string(),
-        Filter::Only(s) => format!("Sessions [{}]", status_word(s)),
+        Filter::All => tr(lang, "render.chooser.title").to_string(),
+        Filter::Only(s) => trf(
+            lang,
+            "render.chooser.title_filter",
+            &[("state", &status_word(lang, s))],
+        ),
     }
 }
 
-fn empty_note(filter: Filter) -> String {
+fn empty_note(lang: Lang, filter: Filter) -> String {
     match filter {
-        Filter::All => "no sessions".to_string(),
-        Filter::Only(s) => format!("no {} panes", status_word(s)),
+        Filter::All => tr(lang, "render.chooser.empty_all").to_string(),
+        Filter::Only(s) => trf(
+            lang,
+            "render.chooser.empty_filter",
+            &[("state", &status_word(lang, s))],
+        ),
     }
 }
 
@@ -530,10 +580,20 @@ fn scroll_marker(cx: &Ctx, up: bool, down: bool) -> Option<String> {
     let ascii = cx.theme.g == ASCII;
     let mut parts = vec![];
     if up {
-        parts.push(if ascii { "^ more" } else { "▲ more" });
+        let key = if ascii {
+            "render.scroll.up_ascii"
+        } else {
+            "render.scroll.up"
+        };
+        parts.push(tr(cx.lang, key));
     }
     if down {
-        parts.push(if ascii { "v more" } else { "▼ more" });
+        let key = if ascii {
+            "render.scroll.down_ascii"
+        } else {
+            "render.scroll.down"
+        };
+        parts.push(tr(cx.lang, key));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
@@ -747,8 +807,8 @@ pub(super) fn draw_overlays(g: &mut Grid, cx: &Ctx) -> bool {
     } else if let Some((text, scroll)) = &c.popup {
         let lines: Vec<Line> = text.iter().map(|l| Line::plain(l)).collect();
         let spec = BoxSpec {
-            title: POPUP_TITLE.to_string(),
-            footer: POPUP_HINT,
+            title: tr(cx.lang, "render.popup.title").to_string(),
+            footer: tr(cx.lang, "render.popup.hint"),
             lines: &lines,
             sel: None,
             scroll: *scroll,
@@ -763,7 +823,8 @@ pub(super) fn draw_overlays(g: &mut Grid, cx: &Ctx) -> bool {
 fn draw_chooser(g: &mut Grid, cx: &Ctx, raw: usize) {
     let (sel, filter) = unpack_chooser(raw);
     let tree = snapshot(cx.st, &cx.s.name);
-    let mut lines: Vec<Line> = chooser_rows(&tree, filter, &cx.theme.g)
+    let lang = cx.lang;
+    let mut lines: Vec<Line> = chooser_rows(&tree, filter, &cx.theme.g, lang)
         .iter()
         .map(Line::from_row)
         .collect();
@@ -773,11 +834,11 @@ fn draw_chooser(g: &mut Grid, cx: &Ctx, raw: usize) {
         Some(sel.min(lines.len() - 1))
     };
     if lines.is_empty() {
-        lines.push(Line::note(&empty_note(filter)));
+        lines.push(Line::note(&empty_note(lang, filter)));
     }
     let spec = BoxSpec {
-        title: chooser_title(filter),
-        footer: chooser_hints(&cx.theme.g),
+        title: chooser_title(lang, filter),
+        footer: chooser_hints(&cx.theme.g, lang),
         lines: &lines,
         sel,
         scroll: 0,
