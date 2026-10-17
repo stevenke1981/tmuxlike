@@ -19,3 +19,6 @@ jobs:
       - name: Smoke test (real pty / ConPTY session)
         timeout-minutes: 5
         run: python scripts/smoke.py
+      - name: Automation API smoke test (JSON CLI, agent state, persistence)
+        timeout-minutes: 8
+        run: python scripts/api_smoke.py
