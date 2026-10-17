@@ -91,6 +91,12 @@ pub struct Glyphs {
     pub tree_last: &'static str,
     pub ok: &'static str,
     pub err: &'static str,
+    /// neutral notice glyph (info toasts, "cancelled"); `ok` is only for successes
+    pub info: &'static str,
+    /// separator inside titles / notices (`claude · blocked`)
+    pub dot: &'static str,
+    /// dash used in prose (`session X ended — now in Y`)
+    pub dash: &'static str,
 }
 
 pub const UNICODE: Glyphs = Glyphs {
@@ -120,6 +126,9 @@ pub const UNICODE: Glyphs = Glyphs {
     tree_last: "└",
     ok: "✓",
     err: "✗",
+    info: "•",
+    dot: "·",
+    dash: "—",
 };
 
 pub const ASCII: Glyphs = Glyphs {
@@ -149,6 +158,9 @@ pub const ASCII: Glyphs = Glyphs {
     tree_last: "\\",
     ok: "+",
     err: "x",
+    info: "*",
+    dot: ".",
+    dash: "-",
 };
 
 /// Resolved theme for one client frame.

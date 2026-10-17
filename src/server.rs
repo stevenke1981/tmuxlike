@@ -153,6 +153,10 @@ pub struct Prompt {
     pub cur: usize,
     /// command line run when a `Confirm` prompt is answered `y`
     pub pending: Option<String>,
+    /// `:` history position while browsing with Up/Down (index into `State.history`)
+    pub hist: Option<usize>,
+    /// for `Confirm`: the pane that was active when asked; `y` refuses if it changed
+    pub expect_pane: Option<usize>,
 }
 
 impl Prompt {
@@ -164,6 +168,8 @@ impl Prompt {
             buf,
             cur,
             pending: None,
+            hist: None,
+            expect_pane: None,
         }
     }
 
@@ -174,6 +180,8 @@ impl Prompt {
             buf: question,
             cur: 0,
             pending: Some(command),
+            hist: None,
+            expect_pane: None,
         }
     }
 }

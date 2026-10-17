@@ -142,6 +142,31 @@ struct Ctx<'a> {
 }
 
 /// Truncate to a display width, appending '…' if cut.
+/// Cut `s` to at most `max` display columns, ending in `ell` when cut (use
+/// `theme.g.ellipsis`, so ASCII mode gets `~`). Never splits a wide character.
+pub fn cut(s: &str, max: usize, ell: &str) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let ew = ell.width();
+    if max < ew {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw + ew > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push_str(ell);
+    out
+}
+
+/// Deprecated: Unicode-only ellipsis; use [`cut`] with the theme ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
