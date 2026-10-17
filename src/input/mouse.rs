@@ -1,32 +1,18 @@
 //! Mouse input: click to focus and select, drag to copy, wheel to scroll.
 //!
 //! Click targets match what is drawn: sidebar lines come from `sidebar_rows`, window labels
-//! from `status_hit`, and the session chip and counters from the spans in `click_status`.
+//! from `status_hit`, and the session chip and counters from `status_regions` (same layout).
 //! Overlays (chooser, key popup) take the wheel; any click closes them, as before.
 use crate::copy::{self, CopyState};
 use crate::layout::Rect;
-use crate::render::{SidebarKind, chooser_entries, sidebar_rows, sidebar_text_width, status_hit};
+use crate::render::{
+    SidebarKind, chooser_entries, sidebar_rows, sidebar_text_width, status_hit, status_regions,
+};
 use crate::server::State;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use unicode_width::UnicodeWidthStr;
 
-/// Width of the status-bar counters block, counted left from the hint.
-const COUNTERS_WIDTH: u16 = 20;
 /// Lines one wheel tick moves a key popup or a pane.
 const WHEEL_LINES: usize = 3;
-
-/// Session chip span: `[name]` occupies columns `0..width(name)+2`.
-fn chip_width(name: &str) -> u16 {
-    name.width() as u16 + 2
-}
-
-/// Counters span, conservatively: the `COUNTERS_WIDTH` columns that end before the hint
-/// (` <prefix> ` = prefix width + 2). A click outside it does nothing. If the status bar's
-/// right block grows, this span moves with the hint and must be updated with it.
-fn counters_span(cols: u16, prefix_width: u16) -> (u16, u16) {
-    let end = cols.saturating_sub(prefix_width + 2);
-    (end.saturating_sub(COUNTERS_WIDTH), end)
-}
 
 impl State {
     /// Handle one mouse event from client `cid` on session index `si`.
@@ -79,8 +65,12 @@ impl State {
             self.start_pane_drag(cid, si, pid, r, m);
             return None;
         }
+        if let Some(pid) = self.title_at(si, m.column, m.row) {
+            self.focus_pane(pid);
+            return None;
+        }
         if m.row == self.sessions[si].rows - 1 {
-            return self.click_status(si, m.column);
+            return self.click_status(cid, si, m.column);
         }
         None
     }
@@ -136,22 +126,32 @@ impl State {
 
     /// Status row: the session chip opens the chooser, window labels switch windows, and the
     /// counters run `next-attention`.
-    fn click_status(&mut self, si: usize, col: u16) -> Option<String> {
-        let (name_w, cols) = {
-            let s = &self.sessions[si];
-            (chip_width(&s.name), s.cols)
-        };
-        if col < name_w {
+    fn click_status(&mut self, cid: usize, si: usize, col: u16) -> Option<String> {
+        let regions = self
+            .clients
+            .get(&cid)
+            .map(|c| status_regions(self, c, &self.sessions[si]))?;
+        let inside = |span: Option<(u16, u16)>| span.is_some_and(|(a, b)| col >= a && col < b);
+        if inside(regions.session) {
             return Some("choose-tree".into());
+        }
+        if inside(regions.counts) {
+            return Some("next-attention".into());
         }
         if let Some(wi) = status_hit(&self.sessions[si], col) {
             self.sessions[si].active = wi;
             self.relayout(si);
-            return None;
         }
-        let prefix_w = self.cfg.prefix.width() as u16;
-        let (start, end) = counters_span(cols, prefix_w);
-        (col >= start && col < end).then(|| "next-attention".to_string())
+        None
+    }
+
+    /// Pane whose title row (reserved above its rect, see `visible_rects`) is at `row`.
+    fn title_at(&self, si: usize, col: u16, row: u16) -> Option<usize> {
+        let s = &self.sessions[si];
+        self.title_rows(s, &s.windows[s.active])
+            .into_iter()
+            .find(|(_, r)| r.y == row && col >= r.x && col < r.x + r.w)
+            .map(|(pid, _)| pid)
     }
 
     fn start_pane_drag(&mut self, cid: usize, si: usize, pid: usize, r: Rect, m: MouseEvent) {
@@ -288,25 +288,5 @@ impl State {
             p.copy = None;
         }
         self.mark_dirty();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chip_span_follows_display_width() {
-        assert_eq!(chip_width("demo"), 6);
-        // "測試" is 4 columns wide, so the chip is 6 columns, not 4 bytes + 2
-        assert_eq!(chip_width("測試"), 6);
-    }
-
-    #[test]
-    fn counters_span_sits_left_of_the_hint() {
-        // 120 cols, prefix C-b (3): hint " C-b " is 5 cols, counters end at col 115
-        assert_eq!(counters_span(120, 3), (95, 115));
-        // narrow terminals clamp instead of underflowing
-        assert_eq!(counters_span(10, 3), (0, 5));
     }
 }

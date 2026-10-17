@@ -50,7 +50,7 @@ try:
     frame = tl("debug-frame", "-t", "ci")
     assert "\x1b[" in frame, "frame has no escape sequences: %r" % frame[:200]
     assert re.search(r"\x1b\[\d+;1H", frame), "frame has no cursor positioning"
-    assert "[ci]" in frame, "status bar missing"
+    assert " ci " in frame, "status bar missing"
     assert "tmuxlike-smoke-ok" in frame, "pane text missing from frame"
     print("frame: %d bytes of ANSI, OK" % len(frame))
     print("PASS")

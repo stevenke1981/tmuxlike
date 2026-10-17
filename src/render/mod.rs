@@ -8,8 +8,10 @@ mod sidebar;
 pub use sidebar::{SidebarKind, sidebar_rows, sidebar_text_width};
 mod status;
 
-pub use overlay::chooser_entries;
-pub use status::status_hit;
+pub use overlay::{
+    Entry, Filter, chooser_entries, kill_target, pack_chooser, unpack_chooser, visible_entries,
+};
+pub use status::{status_hit, status_regions};
 
 use crate::layout::Rect;
 use crate::server::{Client, Session, State};

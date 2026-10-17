@@ -34,7 +34,15 @@ impl State {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(shared, cid, si, k),
             Event::Paste(text) => {
                 if let Some(p) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    p.buf.push_str(&text.replace(['\r', '\n'], " "));
+                    // insert at the cursor, like typing
+                    let text = text.replace(['\r', '\n'], " ");
+                    let at = p
+                        .buf
+                        .char_indices()
+                        .nth(p.cur)
+                        .map_or(p.buf.len(), |(i, _)| i);
+                    p.buf.insert_str(at, &text);
+                    p.cur += text.chars().count();
                     self.mark_dirty();
                     return;
                 }
