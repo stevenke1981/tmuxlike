@@ -40,6 +40,8 @@ const BOLD: u8 = 1;
 const ITALIC: u8 = 2;
 const UNDER: u8 = 4;
 const INVERSE: u8 = 8;
+/// SGR 2: faint text (mono-mode replacement for muted color).
+const DIM: u8 = 16;
 
 impl Default for Cell {
     fn default() -> Self {
@@ -209,8 +211,27 @@ fn sgr_color(c: Color, fg: bool) -> String {
         Color::Magenta => base(95),
         Color::Cyan => base(96),
         Color::White => base(97),
+        // ui-spec §2: indices 0-7 and 8-15 use the classic 3x/4x and 9x/10x codes.
+        Color::AnsiValue(i) if i < 8 => base(30 + i),
+        Color::AnsiValue(i) if i < 16 => base(90 + i - 8),
         Color::AnsiValue(i) => format!("\x1b[{};5;{}m", if fg { 38 } else { 48 }, i),
         Color::Rgb { r, g, b } => format!("\x1b[{};2;{};{};{}m", if fg { 38 } else { 48 }, r, g, b),
+    }
+}
+
+/// Write the attribute SGRs for `attrs` (after a reset).
+fn push_attrs(out: &mut String, attrs: u8) {
+    let flags = [
+        (BOLD, Attribute::Bold),
+        (DIM, Attribute::Dim),
+        (ITALIC, Attribute::Italic),
+        (UNDER, Attribute::Underlined),
+        (INVERSE, Attribute::Reverse),
+    ];
+    for (bit, attr) in flags {
+        if attrs & bit != 0 {
+            let _ = crossterm::Command::write_ansi(&SetAttribute(attr), out);
+        }
     }
 }
 
@@ -241,32 +262,29 @@ fn emit(frame: &mut Frame, g: Grid, cursor_pos: Option<(u16, u16)>) -> String {
                 continue;
             }
             changed = true;
-            if pos != Some((x, y)) {
+            let moved = pos != Some((x, y));
+            if moved {
                 ansi!(out, cursor::MoveTo(x, y));
             }
-            if cur_attrs != Some(c.attrs) {
+            let needs_reset = cur_attrs != Some(c.attrs)
+                || (c.fg == Color::Reset && cur_fg != Some(Color::Reset))
+                || (c.bg == Color::Reset && cur_bg != Some(Color::Reset));
+            if needs_reset {
+                // A full SGR reset also returns both colors to default, so a Reset color
+                // never needs an SGR of its own (chrome in mono emits no 3x/4x codes).
                 ansi!(out, SetAttribute(Attribute::Reset));
-                if c.attrs & BOLD != 0 {
-                    ansi!(out, SetAttribute(Attribute::Bold));
-                }
-                if c.attrs & ITALIC != 0 {
-                    ansi!(out, SetAttribute(Attribute::Italic));
-                }
-                if c.attrs & UNDER != 0 {
-                    ansi!(out, SetAttribute(Attribute::Underlined));
-                }
-                if c.attrs & INVERSE != 0 {
-                    ansi!(out, SetAttribute(Attribute::Reverse));
-                }
+                push_attrs(&mut out, c.attrs);
                 cur_attrs = Some(c.attrs);
-                cur_fg = None;
-                cur_bg = None;
+                cur_fg = Some(Color::Reset);
+                cur_bg = Some(Color::Reset);
             }
-            if cur_fg != Some(c.fg) {
+            // Colors are restated after every cursor move, so each run of a colored chrome
+            // cell (for example the focused border) begins with its SGR.
+            if c.fg != Color::Reset && (moved || cur_fg != Some(c.fg)) {
                 out.push_str(&sgr_color(c.fg, true));
                 cur_fg = Some(c.fg);
             }
-            if cur_bg != Some(c.bg) {
+            if c.bg != Color::Reset && (moved || cur_bg != Some(c.bg)) {
                 out.push_str(&sgr_color(c.bg, false));
                 cur_bg = Some(c.bg);
             }
@@ -310,5 +328,135 @@ mod tests {
         assert!(out.contains("中"));
         assert!(out.ends_with("\x1b[?2026l"), "{out:?}");
         assert_eq!(truncate("中文名稱很長", 7), "中文名…");
+    }
+
+    /// Any SGR that sets a classic or bright 8/16-color foreground or background.
+    fn has_classic_color_sgr(out: &str) -> bool {
+        let bytes = out.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+                let body: String = out[i + 2..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == ';')
+                    .collect();
+                let end = i + 2 + body.len();
+                if out[end..].starts_with('m') && body.split(';').any(|p| {
+                    matches!(p.parse::<u32>(), Ok(n) if (30..=37).contains(&n) || (40..=47).contains(&n)
+                        || (90..=97).contains(&n) || (100..=107).contains(&n))
+                }) {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn chrome_grid(fg: Color, bg: Color, attrs: u8) -> Grid {
+        let mut g = Grid {
+            w: 8,
+            h: 2,
+            cells: vec![Cell::default(); 16],
+        };
+        g.text(0, 0, 8, "chrome", fg, bg, attrs);
+        g
+    }
+
+    #[test]
+    fn mono_chrome_emits_no_classic_color_sgr() {
+        // Reset colors (what Theme::c returns in mono) must not produce 3x/4x codes.
+        let mut f = Frame::default();
+        let out = emit(
+            &mut f,
+            chrome_grid(Color::Reset, Color::Reset, BOLD | INVERSE),
+            None,
+        );
+        assert!(!has_classic_color_sgr(&out), "{out:?}");
+        assert!(
+            out.contains("\x1b[1m") && out.contains("\x1b[7m"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn mono_switch_from_pane_color_to_chrome_resets_without_color_sgr() {
+        // A colored pane cell followed by a chrome cell: the chrome side needs a full reset,
+        // not a 39m/49m, and the pane color itself stays allowed.
+        let mut g = Grid {
+            w: 2,
+            h: 1,
+            cells: vec![Cell::default(); 2],
+        };
+        g.put(
+            0,
+            0,
+            Cell {
+                s: "a".into(),
+                fg: Color::Red,
+                ..Cell::default()
+            },
+        );
+        g.put(
+            1,
+            0,
+            Cell {
+                s: "b".into(),
+                fg: Color::Reset,
+                bg: Color::Reset,
+                ..Cell::default()
+            },
+        );
+        let mut f = Frame::default();
+        let out = emit(&mut f, g, None);
+        assert!(
+            out.contains("\x1b[91m"),
+            "pane color passes through: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[39m") && !out.contains("\x1b[49m"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn dim_attribute_and_indexed_palette_sgr() {
+        let mut f = Frame::default();
+        let out = emit(
+            &mut f,
+            chrome_grid(Color::AnsiValue(8), Color::Reset, DIM),
+            None,
+        );
+        assert!(out.contains("\x1b[2m"), "{out:?}");
+        assert!(
+            out.contains("\x1b[90m"),
+            "ANSI 8 is the bright-black code: {out:?}"
+        );
+        assert_eq!(sgr_color(Color::AnsiValue(6), true), "\x1b[36m");
+        assert_eq!(sgr_color(Color::AnsiValue(14), false), "\x1b[106m");
+        assert_eq!(sgr_color(Color::AnsiValue(74), true), "\x1b[38;5;74m");
+    }
+
+    #[test]
+    fn colored_cell_after_move_restates_its_sgr() {
+        let mut g = Grid {
+            w: 3,
+            h: 2,
+            cells: vec![Cell::default(); 6],
+        };
+        for y in 0..2 {
+            g.put(
+                0,
+                y,
+                Cell {
+                    s: "┃".into(),
+                    fg: Color::AnsiValue(6),
+                    ..Cell::default()
+                },
+            );
+        }
+        let mut f = Frame::default();
+        let out = emit(&mut f, g, None);
+        assert_eq!(out.matches("\x1b[36m┃").count(), 2, "{out:?}");
     }
 }

@@ -226,6 +226,36 @@ const ATTENTION_GRACE: Duration = Duration::from_secs(2);
 
 pub type Shared = Arc<Mutex<State>>;
 
+/// `pane-titles` policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleMode {
+    Off,
+    /// only in split, unzoomed windows, for panes at least 6 rows high that have an agent
+    /// report or a label
+    Auto,
+    /// every pane of a split, unzoomed window
+    Always,
+}
+
+/// Whether a pane gets a title row (UX-10 / ui-spec §3.4). Pure: `split` = the window has at
+/// least 2 panes, `rect_h` = the pane's layout height including the title row.
+pub fn wants_title(
+    mode: TitleMode,
+    split: bool,
+    zoomed: bool,
+    rect_h: u16,
+    has_info: bool,
+) -> bool {
+    if !split || zoomed {
+        return false;
+    }
+    match mode {
+        TitleMode::Off => false,
+        TitleMode::Always => rect_h >= 2,
+        TitleMode::Auto => rect_h >= 6 && has_info,
+    }
+}
+
 impl State {
     fn id(&mut self) -> usize {
         self.next_id += 1;
@@ -249,15 +279,76 @@ impl State {
         }
     }
 
-    pub fn visible_rects(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
+    /// Pane rects from the layout tree, before title rows are reserved. Zoom gives the active
+    /// pane the whole area.
+    fn layout_rects(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
         let area = self.pane_area(s);
         if w.zoomed {
-            vec![(w.active, area)]
-        } else {
-            let mut v = vec![];
-            w.layout.layout(area, &mut v);
-            v
+            return vec![(w.active, area)];
         }
+        let mut v = vec![];
+        w.layout.layout(area, &mut v);
+        v
+    }
+
+    fn title_mode(&self) -> TitleMode {
+        match self.cfg.pane_titles.as_str() {
+            "off" => TitleMode::Off,
+            "always" => TitleMode::Always,
+            _ => TitleMode::Auto,
+        }
+    }
+
+    fn pane_has_info(&self, pid: usize) -> bool {
+        self.panes
+            .get(&pid)
+            .is_some_and(|p| p.agent.is_some() || p.label.as_deref().is_some_and(|l| !l.is_empty()))
+    }
+
+    /// Panes whose layout rect starts with a title row.
+    fn titled_panes(&self, w: &Window, rects: &[(usize, Rect)]) -> Vec<usize> {
+        let mode = self.title_mode();
+        let split = w.panes().len() >= 2;
+        rects
+            .iter()
+            .filter(|(pid, r)| wants_title(mode, split, w.zoomed, r.h, self.pane_has_info(*pid)))
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
+    /// Content rects of the visible panes. A titled pane's first row is its title, so its
+    /// rect starts one row lower (PTY size and mouse hit-tests use this rect).
+    pub fn visible_rects(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
+        let rects = self.layout_rects(s, w);
+        let titled = self.titled_panes(w, &rects);
+        rects
+            .into_iter()
+            .map(|(pid, r)| {
+                if titled.contains(&pid) {
+                    (
+                        pid,
+                        Rect {
+                            y: r.y + 1,
+                            h: r.h - 1,
+                            ..r
+                        },
+                    )
+                } else {
+                    (pid, r)
+                }
+            })
+            .collect()
+    }
+
+    /// The title row of each titled pane (1 row, same columns as the pane).
+    pub fn title_rows(&self, s: &Session, w: &Window) -> Vec<(usize, Rect)> {
+        let rects = self.layout_rects(s, w);
+        let titled = self.titled_panes(w, &rects);
+        rects
+            .into_iter()
+            .filter(|(pid, _)| titled.contains(pid))
+            .map(|(pid, r)| (pid, Rect { h: 1, ..r }))
+            .collect()
     }
 
     pub(crate) fn sidx(&self, name: &str) -> Option<usize> {
@@ -590,6 +681,15 @@ impl State {
         }
     }
 
+    /// Recompute the layout of `pid`'s session (titles may appear/disappear after an agent
+    /// report or rename, which changes the pane's rect and PTY size). Marks dirty either way.
+    pub(crate) fn relayout_pane(&mut self, pid: usize) {
+        match self.locate(pid) {
+            Some((si, _)) => self.relayout(si),
+            None => self.mark_dirty(),
+        }
+    }
+
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
         let _ = self.notify.send(());
@@ -655,6 +755,11 @@ impl State {
                 let c = self.clients.get_mut(&id).unwrap();
                 c.session = o.clone();
                 c.frame.invalidate();
+                c.message = Some(Message {
+                    text: format!("session {session} ended — now in {o}"),
+                    at: Instant::now(),
+                    error: false,
+                });
                 continue;
             }
             if let Some(mut c) = self.clients.remove(&id) {
@@ -856,7 +961,22 @@ impl State {
                 let text = self.capture(target.as_deref())?;
                 self.buffer = Some(text);
             }
-            other => return Err(format!("{other:?}: needs an attached client")),
+            Cmd::KillSession { target: Some(t) } => {
+                let si = self.target_session(Some(t.as_str()))?;
+                self.kill_session(si);
+            }
+            Cmd::KillWindow { target: Some(t) } => {
+                let (si, wi) = self.window_for(None, Some(t.as_str()))?;
+                self.kill_window_at(si, wi);
+            }
+            Cmd::NextAttention { backward } => {
+                commands::headless_attention(self, backward)?;
+            }
+            Cmd::ConfirmBefore { command, .. } => {
+                // no client to ask: run the command as typed
+                self.exec_global(commands::parse(&command)?)?;
+            }
+            other => return Err(format!("\"{}\" needs an attached client", other.name())),
         }
         Ok(())
     }
@@ -910,13 +1030,31 @@ impl State {
                 let pid = self.active_pane(si);
                 self.pane_exited(pid);
             }
-            Cmd::KillWindow => {
-                let s = &self.sessions[si];
-                for pid in s.windows[s.active].panes() {
-                    self.pane_exited(pid);
+            Cmd::KillWindow { target } => {
+                let (s, w) = self.window_for(Some(si), target.as_deref())?;
+                self.kill_window_at(s, w);
+            }
+            Cmd::KillSession { target } => {
+                let s = match target {
+                    None => si,
+                    Some(t) => self.target_session(Some(t.as_str()))?,
+                };
+                self.kill_session(s);
+            }
+            Cmd::NextAttention { backward } => self.next_attention(cid, si, backward),
+            Cmd::ConfirmBefore { prompt, command } => {
+                if !self.cfg.confirm_close {
+                    // confirm-close off: the command runs at once, as if typed
+                    return self.exec(shared, cid, commands::parse(&command)?);
+                }
+                let text = match prompt {
+                    Some(p) => p,
+                    None => self.confirm_prompt_text(si, &command)?,
+                };
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.prompt = Some(Prompt::confirm(text, command));
                 }
             }
-            Cmd::KillSession => self.kill_session(si),
             Cmd::KillServer => {
                 crate::persist::clear();
                 while !self.sessions.is_empty() {
@@ -1062,16 +1200,7 @@ impl State {
             }
             Cmd::DisplayMessage(m) => self.message(cid, m),
             Cmd::ListKeys => {
-                let mut lines = vec![
-                    format!(
-                        "prefix = {}   (j/k/Space scroll, q closes)",
-                        self.cfg.prefix_name()
-                    ),
-                    String::new(),
-                ];
-                for (k, c) in &self.bindings {
-                    lines.push(format!("{k:>10}  {c}"));
-                }
+                let lines = commands::key_lines(self);
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.popup = Some((lines, 0));
                 }
@@ -1151,21 +1280,12 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                     target,
                     print: true,
                 } => st.capture(target.as_deref()),
-                Cmd::DebugFrame { target } => {
-                    let si = st.target_session(target.as_deref())?;
-                    let mut c = Client {
-                        session: st.sessions[si].name.clone(),
-                        sender: Box::new(std::io::sink()),
-                        prefix: false,
-                        frame: Frame::default(),
-                        prompt: None,
-                        chooser: None,
-                        popup: None,
-                        message: None,
-                        drag: None,
-                        env: crate::theme::ClientEnv::default(),
-                    };
-                    Ok(render_client(&st, &mut c).unwrap_or_default())
+                Cmd::DebugFrame { target, opts } => {
+                    commands::debug_frame(&mut st, target.as_deref(), &opts)
+                }
+                // headless: the CLI gets the chosen pane on its own line
+                Cmd::NextAttention { backward } => {
+                    commands::headless_attention(&mut st, backward).map(|t| format!("{t}\n"))
                 }
                 c => st.exec_global(c).map(|_| String::new()),
             });
@@ -1230,6 +1350,10 @@ fn handle_conn(shared: Shared, cid: usize, stream: interprocess::local_socket::S
                     env,
                 },
             );
+            let first = commands::first_attach();
+            if first && st.cfg.hints {
+                commands::attach_hint(&mut st, cid);
+            }
             st.mark_dirty();
             drop(st);
             while let Ok(msg) = read_msg::<ClientMsg>(&mut r) {
@@ -1388,7 +1512,40 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::contain_vt;
+    use super::{TitleMode, contain_vt, wants_title};
+
+    #[test]
+    fn title_policy_auto_needs_split_height_and_info() {
+        // auto: split, unzoomed, >= 6 rows, and an agent report or label
+        assert!(wants_title(TitleMode::Auto, true, false, 6, true));
+        assert!(
+            !wants_title(TitleMode::Auto, true, false, 5, true),
+            "too short"
+        );
+        assert!(
+            !wants_title(TitleMode::Auto, true, false, 20, false),
+            "plain pane"
+        );
+        assert!(
+            !wants_title(TitleMode::Auto, false, false, 20, true),
+            "single pane"
+        );
+        assert!(
+            !wants_title(TitleMode::Auto, true, true, 20, true),
+            "zoomed"
+        );
+    }
+
+    #[test]
+    fn title_policy_always_and_off() {
+        assert!(wants_title(TitleMode::Always, true, false, 2, false));
+        assert!(
+            !wants_title(TitleMode::Always, true, false, 1, true),
+            "no room for content"
+        );
+        assert!(!wants_title(TitleMode::Always, false, false, 20, true));
+        assert!(!wants_title(TitleMode::Off, true, false, 20, true));
+    }
 
     #[test]
     fn vt100_wide_char_resize_panic_is_contained() {

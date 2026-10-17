@@ -250,8 +250,13 @@ fn report_agent(shared: &Shared, pid: usize, mut r: Report) -> Result<Value, Api
         .ok_or_else(|| ApiError::pane_not_found(pid))?;
     let applied = !is_stale(p.agent.as_ref(), &r.source, r.seq);
     if applied {
+        let turned_blocked = r.state == Status::Blocked
+            && !p.agent.as_ref().is_some_and(|a| a.state == Status::Blocked);
         p.agent = Some(merge_info(p.agent.as_ref(), r));
-        st.mark_dirty();
+        st.relayout_pane(pid);
+        if turned_blocked {
+            crate::commands::notify_blocked(&mut st, pid);
+        }
     }
     Ok(json!({"applied": applied, "pane": pane_obj(&st, pid)?}))
 }
@@ -279,7 +284,7 @@ fn release_agent(
         return Ok(json!({"released": false}));
     }
     p.agent = None;
-    st.mark_dirty();
+    st.relayout_pane(pid);
     Ok(json!({"released": true}))
 }
 

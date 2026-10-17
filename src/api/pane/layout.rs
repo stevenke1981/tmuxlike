@@ -147,7 +147,7 @@ fn rename(shared: &Shared, pane: usize, label: Option<String>) -> ApiResult {
         .get_mut(&pid)
         .ok_or_else(|| ApiError::pane_not_found(pid))?;
     p.label = normalize_label(label.as_deref());
-    st.mark_dirty();
+    st.relayout_pane(pid);
     pane_reply(&st, pid)
 }
 

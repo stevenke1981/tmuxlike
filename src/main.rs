@@ -56,7 +56,9 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
   \"  or -     split top/bottom     arrows/hjkl move focus
   Ctrl/Alt+arrows, H J K L  resize pane
   o          next pane            z          zoom pane
-  x          kill pane            &          kill window
+  x          kill pane (y/n)      &          kill window (y/n)
+  Tab        next pane needing you (blocked first, then done)
+  BTab       previous such pane   g          tree chooser (like s / w)
   [ / PgUp   copy mode (hjkl, v/V select, y copy, q exit)
   ]          paste buffer         :          command prompt
   ,          rename window        $          rename session
@@ -64,6 +66,10 @@ const KEYS: &str = "Prefix: Ctrl-b (configurable), then:
   a  or b    toggle sidebar       r          reload config
   ?          list keys            d          detach
   Ctrl-b     send prefix to the program
+Options (`set NAME VALUE` or config.toml):
+  hints on|off            status-bar key hints and the first-attach tip (default on)
+  confirm-close on|off    y/n before x and & (default on; off = kill at once)
+  pane-titles auto|on|off title row per pane (default auto)
 Mouse: click to focus pane / select window in status bar, wheel to scroll, drag to copy.\nCustom bindings: [bind] in config.toml, or `bind-key KEY COMMAND` at the : prompt.";
 
 fn flag(args: &[String], f: &str) -> Option<String> {
