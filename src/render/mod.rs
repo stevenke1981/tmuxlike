@@ -141,7 +141,6 @@ struct Ctx<'a> {
     theme: crate::theme::Theme,
 }
 
-/// Truncate to a display width, appending '…' if cut.
 /// Cut `s` to at most `max` display columns, ending in `ell` when cut (use
 /// `theme.g.ellipsis`, so ASCII mode gets `~`). Never splits a wide character.
 pub fn cut(s: &str, max: usize, ell: &str) -> String {
@@ -163,25 +162,6 @@ pub fn cut(s: &str, max: usize, ell: &str) -> String {
         w += cw;
     }
     out.push_str(ell);
-    out
-}
-
-/// Deprecated: Unicode-only ellipsis; use [`cut`] with the theme ellipsis.
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw + 1 > max {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push('…');
     out
 }
 
@@ -354,7 +334,7 @@ mod tests {
         assert!(out.contains("\x1b[102m"), "{out:?}");
         assert!(out.contains("中"));
         assert!(out.ends_with("\x1b[?2026l"), "{out:?}");
-        assert_eq!(truncate("中文名稱很長", 7), "中文名…");
+        assert_eq!(cut("中文名稱很長", 7, "…"), "中文名…");
     }
 
     /// Any SGR that sets a classic or bright 8/16-color foreground or background.

@@ -1,8 +1,9 @@
 //! Pane contents (vt100 cells, copy-mode label, cursor), pane title rows, and the separators
 //! between panes (ui-spec §3.1, §3.4, UI-03, UI-11).
-use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, ITALIC, UNDER, truncate};
+use super::{BOLD, Cell, Ctx, DIM, Grid, INVERSE, ITALIC, UNDER, cut};
 use crate::api::{AgentInfo, pane_id_str};
 use crate::layout::Rect;
+use crate::theme::Theme;
 use crossterm::style::Color;
 use unicode_width::UnicodeWidthStr;
 
@@ -52,11 +53,11 @@ pub(super) fn draw_panes(g: &mut Grid, cx: &Ctx, covered: &mut [bool]) -> Option
                 if cell.inverse() {
                     attrs |= INVERSE;
                 }
-                if let Some((a, b, line)) = sel {
-                    if crate::copy::in_selection(a, b, line, (crate::copy::abs_row(row, off), col))
-                    {
-                        attrs ^= INVERSE;
-                    }
+                let selected = sel.is_some_and(|(a, b, line)| {
+                    crate::copy::in_selection(a, b, line, (crate::copy::abs_row(row, off), col))
+                });
+                if selected {
+                    attrs ^= INVERSE;
                 }
                 let txt = cell.contents();
                 g.put(
@@ -125,9 +126,19 @@ pub(crate) fn title_name<'a>(agent: Option<&'a AgentInfo>, label: Option<&'a str
         .unwrap_or("pane")
 }
 
-/// Fit a title row of `width` columns: `left` is cut with `…` (CJK-safe); `right` (the pane id)
-/// is kept whole and dropped only when the left part would get less than 4 columns.
-pub(crate) fn fit_title(left: &str, right: &str, width: u16) -> (String, Option<String>) {
+/// Left part of a pane title: ` glyph name · word `, with the theme's dot separator.
+fn title_left(t: &Theme, glyph: &str, name: &str, word: &str) -> String {
+    format!(" {glyph} {name} {} {word} ", t.g.dot)
+}
+
+/// Fit a title row of `width` columns: `left` is cut with `ell` (CJK-safe); `right` (the pane
+/// id) is kept whole and dropped only when the left part would get less than 4 columns.
+pub(crate) fn fit_title(
+    left: &str,
+    right: &str,
+    width: u16,
+    ell: &str,
+) -> (String, Option<String>) {
     const MIN_LEFT: usize = 4;
     let width = width as usize;
     let rw = right.width();
@@ -139,7 +150,7 @@ pub(crate) fn fit_title(left: &str, right: &str, width: u16) -> (String, Option<
     let left = if left_max == 0 {
         String::new()
     } else {
-        truncate(left, left_max)
+        cut(left, left_max, ell)
     };
     (left, right)
 }
@@ -162,8 +173,9 @@ fn draw_titles(g: &mut Grid, cx: &Ctx, covered: &mut [bool]) {
         };
         let (glyph, _, word) = theme.status(crate::api::agent::status(p, &cx.st.cfg));
         let name = title_name(p.agent.as_ref(), p.label.as_deref());
-        let left = format!(" {glyph} {name} · {word} ");
-        let (left, right) = fit_title(&left, &format!("{} ", pane_id_str(pid)), r.w);
+        let left = title_left(theme, glyph, name, word);
+        let right = format!("{} ", pane_id_str(pid));
+        let (left, right) = fit_title(&left, &right, r.w, theme.g.ellipsis);
         if pid == win.active {
             let attrs = BOLD | if theme.mono { INVERSE } else { 0 };
             g.text(
@@ -367,7 +379,8 @@ pub(super) fn draw_borders(g: &mut Grid, cx: &Ctx, covered: &[bool]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::UNICODE;
+    use crate::api::Status;
+    use crate::theme::{ASCII, UNICODE};
 
     fn covered_by(rects: &[Rect]) -> impl Fn(i32, i32) -> bool + '_ {
         move |x, y| rects.iter().any(|r| in_rect(*r, x, y))
@@ -512,14 +525,40 @@ mod tests {
 
     #[test]
     fn fit_title_cuts_cjk_safely_and_keeps_pane_id() {
-        let (left, right) = fit_title(" ○ 測試代理人 · idle ", "p5 ", 16);
+        let (left, right) = fit_title(" ○ 測試代理人 · idle ", "p5 ", 16, "…");
         assert_eq!(right.as_deref(), Some("p5 "));
         assert!(left.ends_with('…'), "{left:?}");
         assert!(left.width() < 16 - 3, "{left:?}");
-        let (left, right) = fit_title(" ▲ claude · blocked ", "p12 ", 8);
+        let (left, right) = fit_title(" ▲ claude · blocked ", "p12 ", 8, "…");
         assert!(right.is_none(), "too narrow: id dropped");
         assert!(left.width() <= 8);
-        assert_eq!(fit_title("abc", "p1 ", 0), (String::new(), None));
+        assert_eq!(fit_title("abc", "p1 ", 0, "…"), (String::new(), None));
+    }
+
+    #[test]
+    fn ascii_title_uses_only_ascii_chrome() {
+        let mut t = Theme::terminal();
+        t.g = ASCII;
+        t.ascii = true;
+        let (glyph, _, word) = t.status(Status::Blocked);
+        let left = title_left(&t, glyph, "claude", word);
+        assert!(left.is_ascii(), "{left:?}");
+        assert_eq!(left, " ! claude . blocked ");
+        for width in [30u16, 14, 8] {
+            let (cut_left, right) = fit_title(&left, "p12 ", width, t.g.ellipsis);
+            assert!(cut_left.is_ascii(), "width {width}: {cut_left:?}");
+            if let Some(id) = &right {
+                assert!(id.is_ascii(), "{id:?}");
+            }
+        }
+        let (cut_left, _) = fit_title(&left, "p12 ", 14, t.g.ellipsis);
+        assert!(cut_left.ends_with('~'), "{cut_left:?}");
+    }
+
+    #[test]
+    fn unicode_title_keeps_the_dot_separator() {
+        let t = Theme::terminal();
+        assert_eq!(title_left(&t, "●", "pi", "idle"), " ● pi · idle ");
     }
 
     #[test]

@@ -2,11 +2,11 @@
 //!
 //! Layout is pure: [`sidebar_rows`] decides what each line shows. The drawer and the mouse
 //! handler both use it, so a click always lands on the line that was drawn.
-use super::{BOLD, Cell, Ctx, Grid, truncate};
+use super::{BOLD, Cell, Ctx, DIM, Grid, cut};
 use crate::api::Status;
 use crate::api::agent::status as agent_status;
 use crate::server::{Session, State};
-use crate::theme::Theme;
+use crate::theme::{Theme, UNICODE};
 use crossterm::style::Color;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -26,7 +26,6 @@ const LEGEND_SPACED: u16 = 28;
 const GAP_MIN_LIST: u16 = 6;
 /// Empty-state hint is wrapped to at most this many lines.
 const EMPTY_LINES: usize = 3;
-const EMPTY_TEXT: &str = "no agent reports — see: tmuxlike pane report-agent --help";
 const LEGEND: [(Status, &str); 4] = [
     (Status::Working, "work"),
     (Status::Blocked, "block"),
@@ -50,7 +49,7 @@ pub enum SidebarKind {
     Detail,
     /// line `n` of the empty-state hint
     Empty(usize),
-    /// `… +N more`: `N` lines below are hidden
+    /// `… +N more`: `N` lines (rows) below are hidden
     More(usize),
     Legend,
     Hint,
@@ -169,7 +168,7 @@ fn item(kind: SidebarKind, pane: Option<usize>, session: Option<usize>) -> Sideb
     }
 }
 
-/// Pure line layout: title, list (ends with `… +N more` on overflow), then the footer.
+/// Pure line layout: title, list (see [`fit_list`]), then the footer.
 fn layout_rows(
     groups: &[GroupView],
     any_agent: bool,
@@ -190,21 +189,190 @@ fn layout_rows(
     }
     let top = if list_h >= GAP_MIN_LIST { 2 } else { 1 };
     let room = list_h.saturating_sub(top) as usize;
-    let mut items = list_items(groups, any_agent, hints, width);
-    if room == 0 {
-        items.clear();
-    } else if items.len() > room {
-        let keep = room - 1;
-        let hidden = items.len() - keep;
-        items.truncate(keep);
-        items.push(item(SidebarKind::More(hidden), None, None));
-    }
-    for (i, mut it) in items.into_iter().enumerate() {
+    let list = fit_list(groups, any_agent, hints, width, room);
+    for (i, mut it) in list.into_iter().enumerate() {
         it.y = top + i as u16;
         rows.push(it);
     }
     push_footer(&mut rows, avail, legend, hint);
     rows
+}
+
+/// Rows of the list that fit in `room` lines, marker included, with one blank line between
+/// group blocks. On overflow the empty-state hint goes first, then closed groups nearest the
+/// attached one, then the attached group's panes far from the focused pane (see [`shed`]).
+fn fit_list(
+    groups: &[GroupView],
+    any_agent: bool,
+    hints: bool,
+    width: u16,
+    room: usize,
+) -> Vec<SidebarRow> {
+    if room == 0 {
+        return vec![];
+    }
+    let flat = list_items(groups, any_agent, hints, width);
+    let all = vec![true; flat.len()];
+    if lines(&flat, &all) <= room {
+        return assemble(&flat, &all);
+    }
+    let attached = groups.iter().find(|g| g.open);
+    let focus = attached
+        .and_then(|g| g.panes.iter().find(|p| p.focused))
+        .map(|p| p.pid);
+    let keep = shed(&flat, attached.map(|g| g.si), focus, room - 1);
+    assemble(&flat, &keep)
+}
+
+/// Lines that the rows marked in `keep` take: one per row, plus one blank line before every
+/// group block after the first.
+fn lines(flat: &[SidebarRow], keep: &[bool]) -> usize {
+    let mut rows = 0;
+    let mut groups = 0;
+    for (r, &k) in flat.iter().zip(keep) {
+        if k {
+            rows += 1;
+            groups += usize::from(is_group_start(r));
+        }
+    }
+    rows + groups.saturating_sub(1)
+}
+
+fn is_group_start(r: &SidebarRow) -> bool {
+    matches!(
+        r.kind,
+        SidebarKind::SessionOpen | SidebarKind::SessionClosed
+    )
+}
+
+/// The kept rows in order, a blank line before each group block after the first, and
+/// `… +N more` counting the rows that were dropped.
+fn assemble(flat: &[SidebarRow], keep: &[bool]) -> Vec<SidebarRow> {
+    let mut out = vec![];
+    let mut seen_group = false;
+    for (r, &k) in flat.iter().zip(keep) {
+        if !k {
+            continue;
+        }
+        if is_group_start(r) {
+            if seen_group {
+                out.push(item(SidebarKind::Gap, None, None));
+            }
+            seen_group = true;
+        }
+        out.push(*r);
+    }
+    let hidden = keep.iter().filter(|k| !**k).count();
+    if hidden > 0 {
+        out.push(item(SidebarKind::More(hidden), None, None));
+    }
+    out
+}
+
+/// Keep mask for an overflowing list; `budget` is the line count for everything but the
+/// marker. The hint rows start dropped. Closed groups are kept nearest the attached one
+/// first. When the attached group alone does not fit, it is windowed around the focus.
+fn shed(
+    flat: &[SidebarRow],
+    open_si: Option<usize>,
+    focus: Option<usize>,
+    budget: usize,
+) -> Vec<bool> {
+    let mut keep: Vec<bool> = flat
+        .iter()
+        .map(|r| r.session.is_some() && r.session == open_si)
+        .collect();
+    if lines(flat, &keep) > budget {
+        return window_open(flat, &keep, focus, budget);
+    }
+    let center = open_si.unwrap_or(0);
+    let mut closed: Vec<usize> = flat
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == SidebarKind::SessionClosed)
+        .map(|(i, _)| i)
+        .collect();
+    closed.sort_by_key(|&i| (flat[i].session.unwrap_or(center).abs_diff(center), i));
+    for i in closed {
+        keep[i] = true;
+        if lines(flat, &keep) > budget {
+            keep[i] = false;
+        }
+    }
+    keep
+}
+
+/// Keeps the attached header plus a run of pane units around the focused pane, as many as
+/// `budget` lines allow. A unit is a pane row with the detail line under it; it is never split,
+/// except that the focused pane may lose its detail line.
+fn window_open(
+    flat: &[SidebarRow],
+    attached: &[bool],
+    focus: Option<usize>,
+    budget: usize,
+) -> Vec<bool> {
+    let mut keep = vec![false; flat.len()];
+    let rows: Vec<usize> = (0..flat.len()).filter(|&i| attached[i]).collect();
+    let Some((&header, body)) = rows.split_first() else {
+        return keep;
+    };
+    if !try_keep(flat, &mut keep, &[header], budget) {
+        return keep;
+    }
+    let units = pane_units(flat, body);
+    if units.is_empty() {
+        return keep;
+    }
+    let f = units
+        .iter()
+        .position(|u| focus.is_some() && flat[u[0]].pane == focus)
+        .unwrap_or(0);
+    let focus_fits = try_keep(flat, &mut keep, &units[f], budget)
+        || try_keep(flat, &mut keep, &units[f][..1], budget);
+    if !focus_fits {
+        return keep;
+    }
+    let (mut lo, mut hi) = (f, f + 1);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        if lo > 0 && try_keep(flat, &mut keep, &units[lo - 1], budget) {
+            lo -= 1;
+            grew = true;
+        }
+        if hi < units.len() && try_keep(flat, &mut keep, &units[hi], budget) {
+            hi += 1;
+            grew = true;
+        }
+    }
+    keep
+}
+
+/// Pane rows with the detail line that follows each, one unit per pane.
+fn pane_units(flat: &[SidebarRow], rows: &[usize]) -> Vec<Vec<usize>> {
+    let mut units: Vec<Vec<usize>> = vec![];
+    for &i in rows {
+        let is_detail = flat[i].kind == SidebarKind::Detail;
+        match units.last_mut() {
+            Some(u) if is_detail => u.push(i),
+            _ => units.push(vec![i]),
+        }
+    }
+    units
+}
+
+/// Marks `rows` kept when the list still fits `budget` lines; otherwise `keep` is unchanged.
+fn try_keep(flat: &[SidebarRow], keep: &mut [bool], rows: &[usize], budget: usize) -> bool {
+    for &i in rows {
+        keep[i] = true;
+    }
+    if lines(flat, keep) <= budget {
+        return true;
+    }
+    for &i in rows {
+        keep[i] = false;
+    }
+    false
 }
 
 /// The richest footer that still leaves `MIN_LIST` rows for the list.
@@ -241,11 +409,11 @@ fn push_footer(rows: &mut Vec<SidebarRow>, avail: u16, legend: bool, hint: bool)
     }
 }
 
-/// Rows above the footer, in order. Overflow is trimmed by `layout_rows`.
+/// Every row above the footer, in draw order, without blank spacers (see [`fit_list`]).
 fn list_items(groups: &[GroupView], any_agent: bool, hints: bool, width: u16) -> Vec<SidebarRow> {
     let mut items = vec![];
     if hints && !any_agent {
-        let n = wrap(EMPTY_TEXT, width).len().min(EMPTY_LINES);
+        let n = empty_lines(width, UNICODE.dash).len().min(EMPTY_LINES);
         items.extend((0..n).map(|i| item(SidebarKind::Empty(i), None, None)));
     }
     for g in groups {
@@ -260,12 +428,17 @@ fn list_items(groups: &[GroupView], any_agent: bool, hints: bool, width: u16) ->
                 items.push(item(SidebarKind::Detail, Some(p.pid), Some(g.si)));
             }
         }
-        items.push(item(SidebarKind::Gap, None, None));
-    }
-    while items.last().is_some_and(|r| r.kind == SidebarKind::Gap) {
-        items.pop();
     }
     items
+}
+
+/// Empty-state hint. `dash` is `theme.g.dash` (an em dash, or `-` in ASCII mode). Both are one
+/// column wide, so the wrapped line count does not depend on the glyph set.
+fn empty_lines(width: u16, dash: &str) -> Vec<String> {
+    wrap(
+        &format!("no agent reports {dash} see: tmuxlike pane report-agent --help"),
+        width,
+    )
 }
 
 /// Greedy word wrap by display width; a word wider than `width` is split between characters.
@@ -343,6 +516,11 @@ fn hint_text(prefix: &str) -> String {
     format!("{prefix} a hide  {prefix} s switch")
 }
 
+/// Attribute for muted chrome: faint in mono mode (no color to tell it apart), plain otherwise.
+fn dim_if_mono(t: &Theme) -> u8 {
+    if t.mono { DIM } else { 0 }
+}
+
 /// Where the sidebar draws: text origin and width, plus the theme and the prefix key.
 struct Lane<'a> {
     t: &'a Theme,
@@ -396,6 +574,9 @@ fn draw_row(g: &mut Grid, l: &Lane, row: &SidebarRow, groups: &[GroupView]) {
             .find(|p| p.pid == pid)
     });
     let muted = l.t.c(l.t.muted);
+    let dim = dim_if_mono(l.t);
+    let ell = l.t.g.ellipsis;
+    let tw = l.tw as usize;
     match row.kind {
         SidebarKind::Title => {
             g.text(
@@ -410,7 +591,7 @@ fn draw_row(g: &mut Grid, l: &Lane, row: &SidebarRow, groups: &[GroupView]) {
         }
         SidebarKind::SessionOpen => {
             if let Some(gr) = group {
-                let label = truncate(&format!("{} {}", l.t.g.group_open, gr.name), l.tw as usize);
+                let label = cut(&format!("{} {}", l.t.g.group_open, gr.name), tw, ell);
                 g.text(l.tx, y, l.tw, &label, l.t.c(l.t.accent), Color::Reset, BOLD);
             }
         }
@@ -427,27 +608,27 @@ fn draw_row(g: &mut Grid, l: &Lane, row: &SidebarRow, groups: &[GroupView]) {
         SidebarKind::Detail => {
             if let Some(m) = pane.and_then(|p| p.message.as_deref()) {
                 let room = l.tw.saturating_sub(PANE_PREFIX);
-                let m = truncate(m, room as usize);
-                g.text(l.tx + PANE_PREFIX, y, room, &m, muted, Color::Reset, 0);
+                let m = cut(m, room as usize, ell);
+                g.text(l.tx + PANE_PREFIX, y, room, &m, muted, Color::Reset, dim);
             }
         }
         SidebarKind::Empty(i) => {
-            if let Some(line) = wrap(EMPTY_TEXT, l.tw).get(i) {
-                let line = truncate(line, l.tw as usize);
-                g.text(l.tx, y, l.tw, &line, muted, Color::Reset, 0);
+            if let Some(line) = empty_lines(l.tw, l.t.g.dash).get(i) {
+                let line = cut(line, tw, ell);
+                g.text(l.tx, y, l.tw, &line, muted, Color::Reset, dim);
             }
         }
         SidebarKind::More(n) => {
-            let label = truncate(&format!("{} +{} more", l.t.g.ellipsis, n), l.tw as usize);
-            g.text(l.tx, y, l.tw, &label, muted, Color::Reset, 0);
+            let label = cut(&format!("{ell} +{n} more"), tw, ell);
+            g.text(l.tx, y, l.tw, &label, muted, Color::Reset, dim);
         }
         SidebarKind::Legend => {
-            let text = truncate(&legend_text(l.t, l.tw >= LEGEND_SPACED), l.tw as usize);
-            g.text(l.tx, y, l.tw, &text, muted, Color::Reset, 0);
+            let text = cut(&legend_text(l.t, l.tw >= LEGEND_SPACED), tw, ell);
+            g.text(l.tx, y, l.tw, &text, muted, Color::Reset, dim);
         }
         SidebarKind::Hint => {
-            let text = truncate(&hint_text(&l.prefix), l.tw as usize);
-            g.text(l.tx, y, l.tw, &text, muted, Color::Reset, 0);
+            let text = cut(&hint_text(&l.prefix), tw, ell);
+            g.text(l.tx, y, l.tw, &text, muted, Color::Reset, dim);
         }
         SidebarKind::Gap => {}
     }
@@ -456,6 +637,7 @@ fn draw_row(g: &mut Grid, l: &Lane, row: &SidebarRow, groups: &[GroupView]) {
 /// `▸ name` with right-aligned counts. Counts go first when the name would get < `MIN_NAME`.
 fn draw_closed(g: &mut Grid, l: &Lane, y: u16, gr: &GroupView) {
     let t = l.t;
+    let dim = dim_if_mono(t);
     let pieces: Vec<(String, Color)> = counts(&gr.panes)
         .into_iter()
         .map(|(s, n)| {
@@ -472,11 +654,8 @@ fn draw_closed(g: &mut Grid, l: &Lane, y: u16, gr: &GroupView) {
     } else {
         name_room
     };
-    let label = format!(
-        "{} {}",
-        t.g.group_closed,
-        truncate(&gr.name, name_budget as usize)
-    );
+    let name = cut(&gr.name, name_budget as usize, t.g.ellipsis);
+    let label = format!("{} {name}", t.g.group_closed);
     g.text(l.tx, y, l.tw, &label, Color::Reset, Color::Reset, 0);
     if !show_counts {
         return;
@@ -487,7 +666,7 @@ fn draw_closed(g: &mut Grid, l: &Lane, y: u16, gr: &GroupView) {
         if i > 0 {
             x += 1;
         }
-        x += g.text(x, y, end - x, s, *color, Color::Reset, 0);
+        x += g.text(x, y, end - x, s, *color, Color::Reset, dim);
     }
 }
 
@@ -508,7 +687,7 @@ fn draw_pane(g: &mut Grid, l: &Lane, y: u16, p: &PaneView) {
     let show_word = room >= word_w + 1 + MIN_NAME;
     let name_room = if show_word { room - word_w - 1 } else { room };
     if name_room > 0 {
-        let name = truncate(&p.name, name_room as usize);
+        let name = cut(&p.name, name_room as usize, t.g.ellipsis);
         let attr = if p.focused { BOLD } else { 0 };
         g.text(
             l.tx + PANE_PREFIX,
@@ -522,7 +701,15 @@ fn draw_pane(g: &mut Grid, l: &Lane, y: u16, p: &PaneView) {
     }
     if show_word {
         let x = l.tx + l.tw - word_w;
-        g.text(x, y, word_w, word, t.c(t.muted), Color::Reset, 0);
+        g.text(
+            x,
+            y,
+            word_w,
+            word,
+            t.c(t.muted),
+            Color::Reset,
+            dim_if_mono(t),
+        );
     }
 }
 
